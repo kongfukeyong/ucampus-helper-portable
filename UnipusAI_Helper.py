@@ -1,34 +1,30 @@
-from AudioRecognizer import AudioTranscriber
-from EnvironmentChecker import EnvironmentChecker
-import hashlib, json, logging, os, sys, random, re, tempfile, threading, time, winsound
-import queue
-import socket
+﻿import hashlib, json, logging, os, sys, random, re, tempfile, threading, time, base64
+try:
+    import winsound
+except ImportError:
+    class _MockWinsound:
+        @staticmethod
+        def MessageBeep(*args, **kwargs):
+            try:
+                print('\a', end='', flush=True)
+            except Exception:
+                pass
+    winsound = _MockWinsound()
+import shutil
 import subprocess
+import urllib.request
+import queue
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from glob import glob
 from typing import List, Optional, Dict, Any, Tuple, Callable
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
-from openai import OpenAI
-from selenium import webdriver
-from selenium.webdriver.edge.service import Service
-from selenium.common.exceptions import (NoSuchElementException, TimeoutException,
-                                        StaleElementReferenceException,
-                                        SessionNotCreatedException, WebDriverException)
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from fluent_ui import FluentModernGUI
+from unipus_helper.paths import PROJECT_ROOT
 
-if getattr(sys, 'frozen', False):
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = str(PROJECT_ROOT)
 
 
 def ensure_writable_temp_dir() -> str:
@@ -78,14 +74,35 @@ def ensure_writable_temp_dir() -> str:
         return candidate
     return ''
 
+
+# 必须先确保临时目录可写，再导入 whisper/torch：
+# 系统 temp 不可写时 torch 的 DLL 初始化会直接抛出 WinError 1114。
+ensure_writable_temp_dir()
+
+from unipus_helper.audio_recognizer import AudioTranscriber
+from unipus_helper.browser import DEFAULT_BROWSER, driver_api, get_spec, normalize_browser
+from unipus_helper.environment_checker import EnvironmentChecker
+from openai import OpenAI
+from selenium.common.exceptions import (NoSuchDriverException, NoSuchElementException,
+                                        TimeoutException, StaleElementReferenceException,
+                                        SessionNotCreatedException, WebDriverException)
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
 gui_log_queue = queue.Queue()
 
 DEBUG_MODE = False
 
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.9.11"
 
 DEFAULT_LOGIN_URL = "https://uai.unipus.cn/sso/index.html?service=https%3A%2F%2Fucloud.unipus.cn%2Fhome"
 UCLOUD_HOME_URL = "https://ucloud.unipus.cn/home"
+
+# setup_logging() 之前就要有可用的 logger（测试、模块被 import 时都会走到）
+logger = logging.getLogger('UCampusBot')
 
 
 def setup_logging():
@@ -105,6 +122,10 @@ def setup_logging():
             pass
 
     logger = logging.getLogger('UCampusBot')
+    if logger.handlers:
+        # 已经初始化过：重复调用会把 sys.stdout（此时已被 PrintRedirector 接管）
+        # 再包一层 StreamHandler，日志会自我递归直到 RecursionError
+        return logger
     logger.setLevel(logging.DEBUG)
     logger.handlers = []
     log_dir = os.path.join(BASE_DIR, 'logs')
@@ -170,6 +191,14 @@ class Config:
     model: str
     temperature: float
     max_tokens: int
+    # 录音题（Exercise 2 这类没有原声的自由作答）用 TTS 合成语音
+    tts_engine: str = "auto"  # auto / edge / sapi / off
+    tts_voice: str = ""       # 留空按引擎给默认英语音色
+    tts_proxy: str = ""       # edge-tts 走代理时填，如 http://127.0.0.1:7890
+    # 题目区域截图一并发给支持识图的模型（如 qwen-vl、gpt-4o），默认关闭
+    screenshot: bool = False
+    # 浏览器后端：edge（默认）/ chrome，见 unipus_helper/browser.py
+    browser: str = DEFAULT_BROWSER
 
     @classmethod
     def from_json(cls, path: str = "config.json") -> "Config":
@@ -186,7 +215,12 @@ class Config:
             base_url=data.get("base_url", "https://api.moonshot.cn/v1"),
             model=data.get("model", "kimi-k2-turbo-preview"),
             temperature=data.get("temperature", 0.3),
-            max_tokens=data.get("max_tokens", 2000),
+            max_tokens=data.get("max_tokens", 32768),
+            tts_engine=(data.get("tts_engine") or "auto").strip(),
+            tts_voice=(data.get("tts_voice") or "").strip(),
+            tts_proxy=(data.get("tts_proxy") or "").strip(),
+            screenshot=bool(data.get("screenshot", False)),
+            browser=normalize_browser(data.get("browser")),
         )
 
 
@@ -243,6 +277,7 @@ class QuestionType(Enum):
     BANKED_CLOZE = auto()
     VOCABULARY_TEST = auto()  # 词汇测试（英汉互译）
     VIDEO = auto()  # 纯视频页面
+    AUDIO = auto()  # 纯听音频页面，需要播放至自然结束
     DISCUSSION_BOARD = auto()
     SELF_CHECK = auto()
     MY_VOICE_TEXT = auto()
@@ -251,6 +286,11 @@ class QuestionType(Enum):
     LISTENING_CHOICE = auto()
     VIDEO_CHOICE = auto()
     TRUE_FALSE = auto()  # 判断题（course-v3 播放器 T/F）
+    MATCHING = auto()  # 人物 A-F ↔ 陈述 的匹配题（空里只填字母）
+    RECORD = auto()  # 跟读/朗读录音题（course-v2 播放器 oral-study 题型）
+    ORAL_ALOUD = auto()  # 整段朗读：点 start 后强制准备再强制录音
+    LINK_MATCH = auto()  # 连线匹配（course-v3 播放器 React Flow 拖拽连线，text_match_group）
+    PARAGRAPH_MATCH = auto()  # 段落信息匹配（Skimming and scanning，空里只填段落字母 A-O）
 
 
 @dataclass
@@ -277,6 +317,8 @@ class Question:
     group: Any = None  # course-v3 题目组容器（提交单位）
     needs_upload: bool = False  # course-v3 需要上传附件的题型
     blank_count: int = 0  # course-v3 下拉空位可能没有 input
+    record_items: List[Dict] = field(default_factory=list)  # 录音题：逐条 {index,url,name,duration,text,element}
+    link_items: List[Dict] = field(default_factory=list)  # 连线匹配：逐节点 {i,id,side,text}，right=提示，left=选项
 
     @property
     def answer_count(self) -> int:
@@ -284,9 +326,11 @@ class Question:
 
     def is_interactive(self) -> bool:
         """是否有交互元素"""
-        if self.q_type in [QuestionType.VIDEO,
+        if self.q_type in [QuestionType.VIDEO, QuestionType.AUDIO,
                            QuestionType.VOCABULARY_FLASHCARD,  # 闪卡需要交互
                            QuestionType.DISCUSSION_BOARD,
+                           QuestionType.RECORD,
+                           QuestionType.ORAL_ALOUD,
                            QuestionType.SELF_CHECK]:
             return True
         return bool(self.options or self.inputs or self.banked_blanks)
@@ -298,6 +342,263 @@ class Question:
             return False
         phrase_count = sum(1 for opt in self.banked_options if ' ' in opt.strip() or len(opt) > 15)
         return phrase_count / len(self.banked_options) > 0.3
+
+    @property
+    def needs_speech_script(self) -> bool:
+        """录音题里有没有既无原声、也无指定朗读文本的条目。
+
+        Vocabulary / Exercise 1 的跟读题自带参考音频，直接把原声喂进麦克风即可；
+        Exercise 2 这类主观题只有一个计时录音按钮，没有原声，只能先让模型写口语稿
+        再用 TTS 合成。
+        """
+        items = self.record_items or []
+        if not items:
+            return False
+        return any(not (item.get('url') or '').strip()
+                   and not (item.get('text') or '').strip() for item in items)
+
+
+CJK_HINT_PATTERN = re.compile(r'[（(]\s*([\u4e00-\u9fa5][^（）()]{0,40}?)\s*[）)]')
+CJK_CHAR_PATTERN = re.compile(r'[\u4e00-\u9fa5]')
+
+# Expressions in use / Words in use：Directions 要求「用所给表达填空、按需变形、每个只用一次」
+EXPRESSION_BANK_PATTERN = re.compile(
+    r'expressions?\s+given\s+below|fill\s+in\s+the\s+blanks\s+with\s+the\s+expressions',
+    re.I,
+)
+EXPRESSION_FORM_PATTERN = re.compile(r'change\s+the\s+form', re.I)
+EXPRESSION_ONCE_PATTERN = re.compile(r'each\s+expression|expressions?\s+can\s+be\s+used', re.I)
+
+EXPRESSION_BANK_HINTS = [
+    "【短语变形填空】请输出按句子语法变形后的完整表达，不要照抄词库原形。",
+    "1. 不规则动词整体变化：dig up→dug up、take up→took up、come to the rescue→came to the rescue。",
+    "2. 空格若缺助动词或 be 动词，要一并写进空里：will get away from、are equipped with（be 随主语变位）。",
+    "3. take ... for granted 的 ... 要换成句子需要的宾语；put one's feet up 的 one's 要按主语换成 their / his / her。",
+    "4. 词库里每个表达恰好用一次：不要重复、不要漏用；先通读全部句子做全局分配，再逐空给答案。",
+    "5. 每个空可以包含多个单词，答案里不要带括号注释、词形解释或其它说明。",
+    "6. 只有空位在句首时首字母才大写：At the heart of / Early on / In the course of；句中一律保持小写：distinguish / come up with / wrestled with / rather than / refrain from。平台大小写也计分。",
+]
+
+
+def is_expression_bank_question(q: "Question") -> bool:
+    """Directions 明确要求「用所给表达填空并按需变形」的短语题。
+
+    用 Directions 文本判定，不依赖词库容器的 class——同一题型在不同教材里
+    渲染结构并不一致，靠 DOM 特征识别容易整题漏判、退化成普通填空。
+    """
+    text = f"{getattr(q, 'directions', '') or ''}\n{getattr(q, 'text', '') or ''}"
+    if EXPRESSION_BANK_PATTERN.search(text):
+        return True
+    # 只有「change the form」+「each expression ... only once」同时出现才算，
+    # 避免把 Words in use（单词变形）也当成多词短语题。
+    return bool(EXPRESSION_FORM_PATTERN.search(text)
+                and EXPRESSION_ONCE_PATTERN.search(text))
+
+# Cloze 下拉选择题：不同教材用的下拉组件不一样（Ant Select / 自绘 / 原生 select），
+# 但占位文案是统一的「点击选择」。优先按文案定位，class 只作为兜底，避免整题漏判。
+CLOZE_DROPDOWN_PLACEHOLDER = '点击选择'
+DROPDOWN_TRIGGER_SELECTOR = (
+    '.scoop-select-wrapper, .ant-select, .ant-select-selector, '
+    '.ant-dropdown-trigger, [role="combobox"], select'
+)
+
+DROPDOWN_TRIGGER_JS = """
+const root = arguments[0];
+const SEL = %s;
+const LABEL = %s;
+const visible = (el) => el && el.getClientRects && el.getClientRects().length > 0;
+const byText = [];
+const seen = new Set();
+const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+let node;
+while ((node = walker.nextNode())) {
+    if ((node.textContent || '').indexOf(LABEL) < 0) continue;
+    let el = node.parentElement;
+    let picked = null;
+    for (let i = 0; i < 4 && el && el !== root; i++) {
+        if (el.matches('a,button,[role="button"],[role="combobox"],[class*="select"],[class*="dropdown"],[tabindex]')) {
+            picked = el;
+            break;
+        }
+        el = el.parentElement;
+    }
+    const target = picked || node.parentElement;
+    if (visible(target) && !seen.has(target)) { seen.add(target); byText.push(target); }
+}
+if (byText.length) return byText;
+const bySelector = [];
+root.querySelectorAll(SEL).forEach(function (el) {
+    if (visible(el) && !seen.has(el)) { seen.add(el); bySelector.push(el); }
+});
+return bySelector;
+""" % (json.dumps(DROPDOWN_TRIGGER_SELECTOR, ensure_ascii=False),
+       json.dumps(CLOZE_DROPDOWN_PLACEHOLDER, ensure_ascii=False))
+
+
+def find_dropdown_triggers(driver, root):
+    """返回容器内可见的下拉触发器元素列表（不依赖具体组件 class）。"""
+    try:
+        return driver.execute_script(DROPDOWN_TRIGGER_JS, root) or []
+    except Exception:
+        return []
+
+
+def has_visible_dropdown(driver, root) -> bool:
+    return bool(find_dropdown_triggers(driver, root))
+
+
+# 「已给出的首字母」只可能是短短的字母串；这些常用词是句子里正常出现的词，不是提示
+PREFIX_STOPWORDS = {
+    'a', 'an', 'the', 'and', 'or', 'of', 'to', 'in', 'on', 'at', 'for', 'with', 'by',
+    'as', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'that', 'this', 'these',
+    'those', 'it', 'its', 'their', 'his', 'her', 'our', 'your', 'my', 'from', 'into',
+    'about', 'than', 'then', 'so', 'but', 'if', 'when', 'while', 'can', 'will',
+    'would', 'should', 'could', 'may', 'might', 'must', 'have', 'has', 'had', 'do',
+    'does', 'did', 'not', 'no', 'more', 'most', 'very', 'also', 'such', 'which',
+    'who', 'whom', 'whose', 'there', 'here', 'we', 'you', 'they', 'he', 'she', 'i',
+    'per', 'all', 'any', 'some', 'each', 'every', 'both', 'other', 'same', 'own',
+}
+
+
+def looks_like_given_prefix(hint: str) -> bool:
+    """判断「空位前的字母」到底是教材印出的首字母，还是句子里普通的单词。"""
+    text = (hint or '').strip()
+    if not text or len(text) > 5:
+        return False
+    if text.lower() in PREFIX_STOPWORDS:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z'\-]*", text))
+
+
+def extract_cjk_hints(text: str) -> List[str]:
+    """取出题干括号里的中文提示，例如 `____ (老年大学)` → ['老年大学']。"""
+    return [hint.strip() for hint in CJK_HINT_PATTERN.findall(text or '') if hint.strip()]
+
+
+def blank_cjk_hints(q: "Question") -> List[str]:
+    """按空位对齐的中文括注；对不齐（空数与括注数不一致）时返回空列表。"""
+    inputs = getattr(q, 'inputs', None) or []
+    count = len(inputs)
+    if count <= 0:
+        return []
+
+    aligned = []
+    for blank in (getattr(q, 'banked_blanks', None) or [])[:count]:
+        around = f"{blank.get('right_context') or ''} {blank.get('context') or ''}"
+        found = extract_cjk_hints(around)
+        aligned.append(found[0] if found else '')
+    if len(aligned) == count and all(aligned):
+        return aligned
+
+    hints = extract_cjk_hints(getattr(q, 'text', '') or '')
+    return hints if len(hints) == count else []
+
+
+def _normalize_vocab_key(text: str) -> str:
+    """中文释义归一化：去括注、去标点、去空格，降低对照表命中难度。"""
+    value = (text or '').strip()
+    value = re.sub(r'[（(].*?[)）]', '', value)
+    value = re.sub(r'[\s，,。.；;、:：!！?？\'"“”‘’…—-]+', '', value)
+    return value.lower()
+
+
+class VocabularyStore:
+    """Vocabulary 页的中英对照缓存。
+
+    Exercise 1 的填空题就是把 Vocabulary 里的词按中文提示还原成英文，让模型
+    自由发挥时经常写错搭配（例如把「老年大学」译成 the elderly university）。
+    这里把页面上的对照表收下来：能直接命中的空完全不问模型，命不中的则把整张
+    对照表塞进提示词，要求模型优先使用已有译法。
+    """
+
+    MAX_PAIRS = 80
+
+    def __init__(self):
+        self.pairs: Dict[str, str] = {}       # 归一化中文 → 英文
+        self.rows: List[Tuple[str, str]] = []  # (英文, 中文) 按页面出现顺序
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def add_rows(self, rows) -> int:
+        """批量写入 [(en, zh)] 或 [{'en':..,'zh':..}]，返回新增条数。"""
+        added = 0
+        for row in rows or []:
+            if isinstance(row, dict):
+                en, zh = row.get('en') or row.get('english'), row.get('zh') or row.get('chinese')
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                en, zh = row[0], row[1]
+            else:
+                continue
+            if self.add(en, zh):
+                added += 1
+        return added
+
+    def add(self, en: str, zh: str) -> bool:
+        en = re.sub(r'\s+', ' ', (en or '')).strip(' .;:-')
+        # 原声 <audio> 的 name 参数常带 .wav/.mp3 后缀，不是词本身
+        en = re.sub(r'\.(wav|mp3|m4a|ogg|flac)$', '', en, flags=re.I).strip()
+        zh = re.sub(r'\s+', ' ', (zh or '')).strip(' .;:-')
+        if not en or not zh:
+            return False
+        if not re.search(r'[A-Za-z]{2}', en) or not CJK_CHAR_PATTERN.search(zh):
+            return False
+        if len(en) > 80 or len(zh) > 40:
+            return False
+        key = _normalize_vocab_key(zh)
+        if not key:
+            return False
+        if self.pairs.get(key, '').lower() == en.lower():
+            return False
+        if key not in self.pairs and len(self.rows) >= self.MAX_PAIRS:
+            return False
+        self.pairs[key] = en
+        self.rows = [row for row in self.rows if _normalize_vocab_key(row[1]) != key]
+        self.rows.append((en, zh))
+        return True
+
+    def lookup(self, hint: str) -> Optional[str]:
+        """按中文提示找英文原词：先精确、再包含、最后模糊匹配。"""
+        key = _normalize_vocab_key(hint)
+        if not key:
+            return None
+        if key in self.pairs:
+            return self.pairs[key]
+
+        for candidate, en in self.pairs.items():
+            if not candidate:
+                continue
+            if len(key) >= 2 and (key in candidate or candidate in key):
+                return en
+
+        best, best_score = None, 0.0
+        for candidate, en in self.pairs.items():
+            score = _similarity(key, candidate)
+            if score > best_score:
+                best, best_score = en, score
+        return best if best_score >= 0.84 else None
+
+    def prompt_lines(self, limit: int = 40) -> List[str]:
+        lines = []
+        for en, zh in self.rows[:limit]:
+            lines.append(f"     {zh} = {en}")
+        return lines
+
+    def clear(self):
+        self.pairs.clear()
+        self.rows.clear()
+
+
+def _similarity(left: str, right: str) -> float:
+    """两个归一化中文串的相似度（0-1），用于兜住「老年大学/老年大学校」这类变体。"""
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    common = len(set(left) & set(right))
+    base = max(len(set(left)), len(set(right))) or 1
+    return common / base * 0.9
+
 
 class Selectors:
     """CSS选择器仓库"""
@@ -477,7 +778,7 @@ class OpenAICompatibleClient:
 
     def _add_context_if_new(self, content: str, label: str, ack_label: str) -> bool:
         """添加可复用上下文，按内容哈希去重"""
-        if not content or len(content) < 50:
+        if not content or not content.strip() or (label == '阅读材料' and len(content) < 50):
             return False
 
         passage_hash = hashlib.md5(content.encode()).hexdigest()[:16]
@@ -502,23 +803,50 @@ class OpenAICompatibleClient:
         print(f"    新增{ack_label}（{len(content)}字符），当前共{len(self.accumulated_passages)}份上下文")
         return True
 
-    def ask(self, prompt: str, retry_count: int = 3, stop_requested: Optional[threading.Event] = None) -> Optional[str]:
+    @staticmethod
+    def _is_image_unsupported_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        if not any(word in text for word in
+                   ('image', 'vision', 'multimodal', 'image_url', 'unsupported content')):
+            return False
+        status = getattr(exc, 'status_code', None)
+        if status is None:
+            status = getattr(getattr(exc, 'response', None), 'status_code', None)
+        return status is None or status in (400, 404, 413, 415, 422)
+
+    def ask(self, prompt: str, retry_count: int = 3, stop_requested: Optional[threading.Event] = None,
+            screenshot: Optional[bytes] = None, remember: bool = True,
+            require_image: bool = False) -> Optional[str]:
         """发送问题并获取回答
 
         推理型模型（如 deepseek-flash）可能把 max_tokens 全部消耗在 reasoning 上，
-        导致 content 为空且 finish_reason=length；这里自动放宽预算重试一次。
+        导致 content 为空且 finish_reason=length；这里在重试次数内调整预算和问法。
         """
         print(f"当前ai对话历史共{len(self.conversation_history)}条")
-        max_tokens = self.config.max_tokens
+        # 推理型模型会把预算全烧在 reasoning 上，配置值太小时必然拿不到正文；
+        # 这里设一个下限，配置里写得更小也按 32768 走。
+        max_tokens = max(self.config.max_tokens, 32768)
         for attempt in range(retry_count):
             if stop_requested is not None and stop_requested.is_set():
                 return None
             try:
+                ask_prompt = prompt
+                if attempt > 0:
+                    # 上一轮被推理吃光了预算，第二次直接要求给结论，别绕弯
+                    ask_prompt = prompt + "\n\n【重要】请直接给出最终答案，不要输出推理过程，不要解释。"
+                user_message: Dict[str, Any] = {"role": "user", "content": ask_prompt}
+                if screenshot:
+                    user_message = {"role": "user", "content": [
+                        {"type": "text", "text": ask_prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": "data:image/png;base64," +
+                                   base64.b64encode(screenshot).decode('ascii')}},
+                    ]}
                 messages = [
                     {"role": "system", "content": self.SYSTEM_PROMPT},
                     *getattr(self, 'material_messages', []),
                     *self.conversation_history,
-                    {"role": "user", "content": prompt}
+                    user_message,
                 ]
 
                 if DEBUG_MODE:
@@ -536,15 +864,40 @@ class OpenAICompatibleClient:
                         print(f"   [{i}] {role}: {preview}")
                     print("=" * 60 + "\n")
 
-                response = self.client.chat.completions.create(
-                    model=self.config.model,
-                    messages=messages,
-                    temperature=self.config.temperature,
-                    max_tokens=max_tokens
-                )
+                # 推理型模型思考时可能几十秒没有输出，先明确告诉用户「已经发出去了」，
+                # 否则界面空白会让人以为脚本卡死。
+                shot = f"，附截图 {len(screenshot) // 1024} KB" if screenshot else ""
+                print(f"【请求】已向 AI 发送请求（{len(ask_prompt)} 字{shot}，max_tokens={max_tokens}，"
+                      f"第 {attempt + 1}/{retry_count} 次），等待 {self.config.model} 返回...")
+                request_started = time.time()
 
+                # 有的模型/网关不接受超大 max_tokens，报错就减半重试，别整题失败
+                request_tokens = max_tokens
+                while True:
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=self.config.model,
+                            messages=messages,
+                            temperature=self.config.temperature,
+                            max_tokens=request_tokens
+                        )
+                        break
+                    except Exception as exc:
+                        message = str(exc).lower()
+                        rejects_budget = ('max_tokens' in message or 'max output' in message
+                                          or 'too large' in message or 'maximum context' in message)
+                        if rejects_budget and request_tokens > 4096:
+                            print(f"    模型不接受 max_tokens={request_tokens}，减半到 {request_tokens // 2} 重试")
+                            request_tokens //= 2
+                            continue
+                        raise
+                max_tokens = request_tokens
+
+                elapsed = time.time() - request_started
                 finish_reason = response.choices[0].finish_reason
                 answer = (response.choices[0].message.content or "").strip()
+                print(f"【返回】AI 已返回（耗时 {elapsed:.1f}s，finish_reason={finish_reason}，"
+                      f"{len(answer)} 字）")
 
                 if DEBUG_MODE:
                     print("\n" + "=" * 60)
@@ -556,23 +909,34 @@ class OpenAICompatibleClient:
                     print("=" * 60 + "\n")
 
                 if not answer:
-                    if finish_reason == 'length' and max_tokens < 32768:
-                        max_tokens = min(max_tokens * 2, 32768)
-                        print(f"推理耗尽 token（finish_reason=length），放宽 max_tokens 到 "
-                              f"{max_tokens} 重试")
+                    if finish_reason == 'length':
+                        if attempt == retry_count - 1:
+                            print("推理耗尽 token，已达到最大重试次数")
+                            return None
+                        if max_tokens < 32768:
+                            max_tokens = min(max_tokens * 2, 32768)
+                        print(f"推理耗尽 token（finish_reason=length），使用 max_tokens="
+                              f"{max_tokens} 和简化问法重试")
                         continue
                     print(f"模型返回空内容（finish_reason={finish_reason}）")
                     return None
 
-                self.conversation_history.append({"role": "user", "content": prompt})
-                self.conversation_history.append({"role": "assistant", "content": answer})
+                if remember:
+                    self.conversation_history.append({"role": "user", "content": prompt})
+                    self.conversation_history.append({"role": "assistant", "content": answer})
 
-                self.conversation_history = self.conversation_history[-20:]
+                    self.conversation_history = self.conversation_history[-20:]
 
                 print(f"AI回答: {answer}")
                 return answer
 
             except Exception as e:
+                if screenshot is not None and self._is_image_unsupported_error(e):
+                    if require_image:
+                        print("   接口无法识别题目图片，停止作答")
+                        return None
+                    screenshot = None
+                    print("   接口拒绝图片，改用纯文本重试")
                 if DEBUG_MODE:
                     import traceback
                     print("\n" + "=" * 60)
@@ -645,19 +1009,29 @@ class QuestionParser:
     def __init__(self, driver):
         self.driver = driver
         self.strategies: List[QuestionParserStrategy] = [
+            RolePlayStrategy(),
+            ParagraphMatchingStrategy(),  # 段落信息匹配：条件最独特，放最前避免被通用策略抢走
+            VocabularyReadAloudStrategy(),  # 词汇跟读卡片：优先于 RecordStrategy
+            OralAloudStrategy(),  # 整段朗读题：靠 .p-oral-aloud 判定
+            VideoDubStrategy(),  # 须先于 VideoStrategy
             VideoStrategy(),
+            AudioStrategy(),
             DiscussionBoardStrategy(),
+            RecordStrategy(),  # 跟读录音题：靠 .record-icon.button-record 判定，必须在通用策略之前
+            ChecklistStrategy(),
             SelfCheckStrategy(),
             SortingStrategy(),
             VocabularyFlashcardStrategy(),
             VocabularyTestStrategy(),
             DropdownSelectStrategy(),
             BankedClozeStrategy(),
+            MatchingStrategy(),  # 人物 A-F 匹配题必须在听力填空之前，否则会被当成写单词
             ListeningFillInStrategy(),  # 听力填空（转录由AISolver预处理完成）
             StandardChoiceStrategy(),
             MyVoiceTextStrategy(),
             TextInputStrategy(),
             FillInStrategy(),
+            GenericReplyStrategy(),  # 兜底：翻译/总结/首字母搭配等结构不固定的页面
         ]
 
     def _find_reading_question_containers(self) -> List[Any]:
@@ -753,9 +1127,29 @@ class QuestionParser:
 
     def parse_all(self) -> Tuple[List[Question], str]:
         """解析所有可见题目"""
+        try:
+            return self._parse_all_once()
+        except StaleElementReferenceException:
+            print("     页面已更新，重新获取题目")
+            return self._parse_all_once()
+
+    def _parse_all_once(self) -> Tuple[List[Question], str]:
         if self._is_discussion_board_page():
-            print("     检测到讨论板页面，跳过")
-            return [], ""
+            print("     检测到讨论板页面，交给发帖处理器")
+            try:
+                element = self.driver.find_element(By.TAG_NAME, 'body')
+            except Exception:
+                element = None
+            topic = ""
+            for selector in ('.ds-discussion-title', '.discussion-title'):
+                try:
+                    topic = (self.driver.find_element(By.CSS_SELECTOR, selector).text or '').strip()
+                    if topic:
+                        break
+                except Exception:
+                    continue
+            return [Question(number=1, text=topic or "讨论区发帖",
+                             q_type=QuestionType.DISCUSSION_BOARD, element=element)], ""
 
         containers = self._find_containers()
         questions = []
@@ -779,6 +1173,8 @@ class QuestionParser:
                 else:
                     print(f"      容器 {idx} 解析为None")
 
+            except StaleElementReferenceException:
+                raise
             except Exception as e:
                 error_msg = str(e)
                 print(f"       解析容器 {idx} 失败:{error_msg[:50]}")
@@ -817,6 +1213,66 @@ class QuestionParser:
         if self._is_discussion_board_page():
             print("     检测到讨论板页面，跳过")
             return []
+
+        role_play = [c for c in self.driver.find_elements(
+            By.CSS_SELECTOR, '.layoutBody-container')
+                     if c.is_displayed() and c.find_elements(By.CSS_SELECTOR, '.role-play-wrapper')]
+        if role_play:
+            return role_play
+
+        # New words / Phrases and expressions 词汇跟读卡片：结构独特，必须优先于
+        # _find_record_containers()，否则会被 .button-record 兜底选择器收成录音题。
+        try:
+            vocab_containers = [c for c in self.driver.find_elements(
+                By.CSS_SELECTOR, VOCAB_READ_ALOUD_SELECTOR) if c.is_displayed()]
+        except Exception:
+            vocab_containers = []
+        if vocab_containers:
+            print(f"     找到 {len(vocab_containers)} 个词汇跟读页")
+            return vocab_containers
+
+        # 整段朗读：一页一段，点 start 后强制准备再强制录音
+        try:
+            aloud_containers = [c for c in self.driver.find_elements(
+                By.CSS_SELECTOR, '.p-oral-aloud') if c.is_displayed()
+                and c.find_elements(By.CSS_SELECTOR, '.p-oral-aloud-button')]
+        except Exception:
+            aloud_containers = []
+        if aloud_containers:
+            print(f"     找到 {len(aloud_containers)} 个段落朗读题")
+            return aloud_containers
+
+        try:
+            dub_containers = [c for c in self.driver.find_elements(
+                By.CSS_SELECTOR, '.question-video-dub-pc') if c.is_displayed()]
+        except Exception:
+            dub_containers = []
+        if dub_containers:
+            print(f"     找到 {len(dub_containers)} 个视频配音题")
+            return dub_containers
+
+        # 跟读/朗读录音题：每句右侧是麦克风按钮，先按行收容器，避免落到通用判定里
+        record_containers = self._find_record_containers()
+        if record_containers:
+            print(f"     找到 {len(record_containers)} 个跟读录音题容器")
+            return record_containers
+
+        # 自评清单（Wrapping up）优先于选择题判定，否则表格里的图标会被误判成选项
+        checklist_containers = []
+        for container in self.driver.find_elements(By.CSS_SELECTOR, '.layoutBody-container'):
+            try:
+                text = (container.text or '').lower()
+                if 'got it' not in text:
+                    continue
+                has_table = container.find_elements(By.CSS_SELECTOR, 'table, .ant-table-tbody')
+                has_icon = container.find_elements(By.CSS_SELECTOR, '.anticon-border, [aria-label="border"]')
+                if has_table and has_icon and container.is_displayed():
+                    checklist_containers.append(container)
+            except Exception:
+                continue
+        if checklist_containers:
+            print(f"     找到 {len(checklist_containers)} 个自评清单容器")
+            return checklist_containers
 
         reading_containers = self._find_reading_question_containers()
         if reading_containers:
@@ -903,6 +1359,10 @@ class QuestionParser:
                         c.find_elements(By.CSS_SELECTOR, '.question-inputbox, .option, .fe-scoop, textarea') or
                         c.find_elements(By.CSS_SELECTOR, 'input[type="text"]')
                 )
+                # Cloze 下拉选择题只有自绘下拉、没有 input / textarea，
+                # 不补充探测会让整个 .layout-container 在容器发现阶段被丢弃。
+                if not has_content:
+                    has_content = has_visible_dropdown(self.driver, c)
                 if has_content and c.is_displayed():
                     valid_containers.append(c)
             except:
@@ -920,7 +1380,55 @@ class QuestionParser:
             print(f"     备用方案找到 {len(fallback)} 个容器")
             return fallback
 
+        # 最后兜底：页面上只有一个可见的作答区（textarea / 空位）时直接拿它，
+        # 避免「总结/翻译」这类没有标准 layout-container 的页面整页放弃
+        reply_fallback = []
+        for reply in self.driver.find_elements(By.CSS_SELECTOR, '.question-common-abs-reply'):
+            try:
+                if not reply.is_displayed():
+                    continue
+                if reply.find_elements(By.CSS_SELECTOR, 'textarea, .fe-scoop input'):
+                    reply_fallback.append(reply)
+            except Exception:
+                continue
+        if reply_fallback:
+            print(f"     兜底找到 {len(reply_fallback)} 个作答容器")
+            return reply_fallback
+
         return []
+
+    def _find_record_containers(self) -> List[Any]:
+        """跟读/朗读录音题：按每个麦克风按钮所属的句子行收容器。"""
+        buttons = find_record_buttons(self.driver)
+        if not buttons:
+            return []
+
+        rows = []
+        for button in buttons:
+            row = None
+            for xpath in (
+                "ancestor::*[contains(@class,'oral-study-sentence')][1]",
+                "ancestor::div[contains(@class,'oral-paragraph-container')][1]",
+                "ancestor::div[contains(@class,'record-button-group')][1]",
+                "ancestor::div[contains(@class,'layoutBody-container')][1]",
+            ):
+                try:
+                    row = button.find_element(By.XPATH, xpath)
+                    break
+                except Exception:
+                    continue
+            if row is None:
+                # Exercise 2 的自由作答区没有 oral-study 结构，退一层到题块
+                try:
+                    row = button.find_element(
+                        By.XPATH, "ancestor::div[contains(@class,'question-')][1]")
+                except Exception:
+                    row = None
+            if row is None:
+                continue
+            if row not in rows:
+                rows.append(row)
+        return rows
 
     def _is_really_visible(self, element) -> bool:
         """检查元素真正可见"""
@@ -938,10 +1446,14 @@ class QuestionParser:
                     )
                     if parent_display == 'none':
                         return False
+                except StaleElementReferenceException:
+                    raise
                 except:
                     break
 
             return True
+        except StaleElementReferenceException:
+            raise
         except:
             return False
 
@@ -959,6 +1471,8 @@ class QuestionParser:
                         return question
                     else:
                         print(f"      策略返回None")
+            except StaleElementReferenceException:
+                raise
             except Exception as e:
                 error_msg = str(e)
                 print(f"      策略 {strategy.__class__.__name__} 失败: {error_msg[:50]} ")
@@ -966,6 +1480,16 @@ class QuestionParser:
                 continue
         print(f"      没有匹配的策略")
         return None
+
+
+class RolePlayStrategy(QuestionParserStrategy):
+    def can_parse(self, container, driver) -> bool:
+        return bool(container.find_elements(By.CSS_SELECTOR, '.role-play-wrapper'))
+
+    def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
+        return Question(number=question_number, text=directions or '角色扮演录音',
+                        q_type=QuestionType.RECORD, element=container, directions=directions,
+                        record_items=[{'role_play': True, 'text': '角色扮演'}])
 
 
 class DiscussionBoardStrategy(QuestionParserStrategy):
@@ -1023,7 +1547,8 @@ class SelfCheckStrategy(QuestionParserStrategy):
 
         has_table = bool(container.find_elements(By.CSS_SELECTOR, '.ticket-view table, .ant-table-tbody'))
         has_got_it = 'got it' in container.text.lower()
-        has_check_instruction = 'check in the box' in direction_text or "you've learned" in direction_text
+        has_check_instruction = any(kw in direction_text for kw in (
+            'check in the box', "you've learned", 'you have learned', 'self-assessment', 'checklist'))
         return has_table and has_got_it and has_check_instruction
 
     def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
@@ -1216,7 +1741,17 @@ class BankedClozeStrategy(QuestionParserStrategy):
             context = ""
             try:
                 context_elem = scoop.find_element(By.XPATH, './ancestor::p')
-                context = context_elem.text.strip()
+                # WebElement.text 不含 input 的 value，空位会在上下文里凭空消失。
+                # 克隆整句，把输入框换成 ____ 占位符，模型才知道空在哪、前后是什么。
+                context = driver.execute_script("""
+                    const p = arguments[0];
+                    const clone = p.cloneNode(true);
+                    for (const el of clone.querySelectorAll('input, textarea')) {
+                        el.replaceWith(document.createTextNode(' ____ '));
+                    }
+                    return (clone.textContent || '').trim();
+                """, context_elem) or ""
+                context = re.sub(r'\s+', ' ', context).strip()
             except:
                 try:
                     context = scoop.text.strip()
@@ -1239,11 +1774,16 @@ class BankedClozeStrategy(QuestionParserStrategy):
 
         print(f"      找到 {len(banked_blanks)} 个填空位置")
 
+        # 只给每个空 180 字的尾巴，模型猜不出该填哪个搭配；把整段题面（含词库）一起给它
+        material = FillInStrategy._page_material(container, limit=6000)
         question_text = f"选词填空（{len(banked_blanks)}个空）"
+        if material:
+            question_text += f"\n【全文】{material}"
         if banked_options:
-            question_text += f"\n可选选项: {', '.join(banked_options[:5])}"
-            if len(banked_options) > 5:
-                question_text += f" 等共{len(banked_options)}个"
+            # 词库必须完整给出：10 个表达的题组用 [:8] 会把后两个藏成「等共 10 个」，
+            # 模型无法在「每个表达只用一次」的约束下做全局分配。
+            question_text += f"\n可选选项: {', '.join(banked_options)}"
+
 
         return Question(
             number=question_number,
@@ -1421,6 +1961,1056 @@ class MyVoiceTextStrategy(QuestionParserStrategy):
         return ""
 
 
+# New words / Phrases and expressions：词汇跟读卡片（course 播放器 swiper）。
+# 页面上已经给出要读的单词/短语和 1.2 秒原声，不需要 AI 生成任何内容。
+VOCAB_READ_ALOUD_SELECTOR = '.vocabulary-wrapper'
+
+# 从当前 active 卡片读词、原声、进度。swiper 只渲染 active slide，
+# 其余是 "vocabulary card" 占位，所以每翻一张都要重新抓一次。
+VOCAB_CARD_JS = r"""
+return (function (root) {
+  const scope = root || document;
+  const wrapper = (scope.matches && scope.matches('.vocabulary-wrapper'))
+      ? scope
+      : (scope.querySelector('.vocabulary-wrapper') ||
+         document.querySelector('.vocabulary-wrapper'));
+  if (!wrapper) { return {}; }
+  const slide = wrapper.querySelector('.swiper-slide-active') ||
+                wrapper.querySelector('.swiper-vocabulary-slide');
+  if (!slide) { return {}; }
+  const txt = function (sel) {
+    const n = slide.querySelector(sel);
+    return n ? (n.innerText || n.textContent || '').trim() : '';
+  };
+  const audioNode = slide.querySelector('.soundWrap .question-audio audio, .soundWrap audio');
+  const raw = audioNode
+      ? (audioNode.getAttribute('src') || audioNode.getAttribute('title') || '')
+      : '';
+  let duration = 0;
+  const dm = raw.match(/duration=([0-9.]+)/);
+  if (dm) { duration = parseFloat(dm[1]); }
+  let name = '';
+  const nm = raw.match(/name=([^&]*)/);
+  if (nm) { try { name = decodeURIComponent(nm[1]); } catch (e) { name = nm[1]; } }
+  let index = 0, total = 0;
+  const spans = wrapper.querySelectorAll('.progressBar .ratio span');
+  if (spans.length >= 2) {
+    index = parseInt((spans[0].innerText || spans[0].textContent || '').trim(), 10) || 0;
+    total = parseInt((spans[1].innerText || spans[1].textContent || '')
+        .replace(/[^0-9]/g, ''), 10) || 0;
+  }
+  const button = slide.querySelector('.ucomp-recorder .button-record, .button-record');
+  const recordings = Array.from(slide.querySelectorAll('.practice-recorder audio'))
+      .map(a => a.getAttribute('src') || '').filter(Boolean);
+  return {
+    word: txt('.vocWord .component-htmlview'),
+    definition: txt('.explanations'),
+    audio: raw,
+    duration: duration,
+    name: name,
+    index: index,
+    total: total,
+    hasButton: !!button,
+    recording: !!(button && button.querySelector('svg rect[fill="currentColor"]')),
+    recordings: recordings
+  };
+})(arguments[0]);
+"""
+
+# 翻到下一张：优先用 Swiper 实例 API（页面带 swiper-no-swiping，手势不可用），
+# 再退到 next 按钮 / 挂在 window 上的实例。
+VOCAB_NEXT_JS = r"""
+return (function (root, reset) {
+  const scope = root || document;
+  const wrapper = (scope.matches && scope.matches('.vocabulary-wrapper'))
+      ? scope
+      : (scope.querySelector('.vocabulary-wrapper') ||
+         document.querySelector('.vocabulary-wrapper'));
+  if (!wrapper) { return ''; }
+  const sw = wrapper.querySelector('.swiper-container') ||
+             wrapper.querySelector('[class*="swiper-container"]');
+  const move = function (inst) {
+    const method = reset ? 'slideTo' : 'slideNext';
+    if (!inst || typeof inst[method] !== 'function') { return false; }
+    if (reset) { inst.slideTo(0); } else { inst.slideNext(); }
+    return true;
+  };
+  if (sw && move(sw.swiper)) {
+    return 'swiper';
+  }
+  const btn = !reset && wrapper.querySelector(
+      '.swiper-button-next, [class*="vocNext"], [class*="next-btn"], [class*="nextBtn"]');
+  if (btn) { btn.click(); return 'button'; }
+  for (const key of ['vocSwiper', 'swiper', 'mySwiper']) {
+    const inst = window[key];
+    if (move(inst)) {
+      return 'window.' + key;
+    }
+  }
+  return '';
+})(arguments[0], arguments[1]);
+"""
+
+RECORD_BUTTON_SELECTOR = '.record-icon.button-record'
+
+# 兜底选择器：Exercise 2 那种「限时自由作答」的录音按钮不一定带 button-record，
+# 主选择器找不到时依次尝试，避免整题被当成「没有输入框」跳过。
+RECORD_BUTTON_FALLBACKS = (
+    '.button-record',
+    '.oral-record-btn',
+    '.record-btn',
+    '.record-button',
+    '[class*="record"][class*="btn"]',
+)
+
+
+def record_button_selectors() -> Tuple[str, ...]:
+    return (RECORD_BUTTON_SELECTOR,) + RECORD_BUTTON_FALLBACKS
+
+
+# 只要求「听/看」的页面（Listening skills 等）不做转写。
+SKIP_ASR_TITLE_KEYWORDS = ('skill', '技能')
+
+ANSWER_WIDGET_SELECTORS = (
+    '.question-common-abs-choice',
+    '.option-wrapper .option',
+    '.option-wrap',
+    '.banked-options',
+    '.fe-scoop',
+    '.question-common-abs-scoop',
+    '.comp-abs-input input',
+    '.question-inputbox',
+    '.question-common-abs-reply',
+    '.question-common-abs-textmatch .input-wrapper',
+    '.record-icon.button-record',
+    '.button-record',
+    '.blank-item',
+    '[class*="cloze"]',
+    '[class*="fill-blank"]',
+    'input[type="text"]',
+    'input[type="radio"]',
+    'input[type="checkbox"]',
+    'textarea',
+    'select',
+    '[contenteditable="true"]',
+)
+
+
+def find_record_buttons(driver, scope=None) -> List[Any]:
+    """按「主 → 兜底」顺序找录音按钮，返回第一组有结果的可见按钮。"""
+    root = driver if scope is None else scope
+    for selector in record_button_selectors():
+        try:
+            buttons = root.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            continue
+        if not isinstance(buttons, (list, tuple)):
+            continue
+        usable = []
+        for button in buttons:
+            try:
+                if not button.is_displayed():
+                    continue
+                size = button.size or {}
+                # 录音列表容器之类的超大元素不是按钮
+                if (size.get('width') or 0) > 180 or (size.get('height') or 0) > 180:
+                    continue
+            except Exception:
+                continue
+            usable.append(button)
+        if usable:
+            return usable
+    return []
+
+
+# 从 Vocabulary 页抓中英对照。跟读行本身就是「英文 + 中文释义」两行，
+# 原声 <audio> 的 src 里还带 #name=英文，两条路都收一遍。
+VOCAB_PAIRS_JS = r"""
+return (function () {
+  const out = [];
+  const seen = new Set();
+  const CJK = /[\u4e00-\u9fa5]/;
+  const push = function (en, zh) {
+    en = (en || '').replace(/\s+/g, ' ').trim().replace(/^[\s"'“”]+|[\s"'“”]+$/g, '');
+    zh = (zh || '').replace(/\s+/g, ' ').trim();
+    if (!en || !zh) { return; }
+    if (!/[A-Za-z]{2}/.test(en) || CJK.test(en)) { return; }
+    if (!CJK.test(zh)) { return; }
+    if (en.length > 80 || zh.length > 40) { return; }
+    const key = en.toLowerCase() + '|' + zh;
+    if (seen.has(key)) { return; }
+    seen.add(key);
+    out.push({ en: en, zh: zh });
+  };
+  const decodeName = function (raw) {
+    const match = raw.match(/name=([^&]*)/);
+    if (!match) { return ''; }
+    try { return decodeURIComponent(match[1]); } catch (e) { return match[1]; }
+  };
+  const rowText = function (row) {
+    const lines = (row.innerText || '').split('\n').map(function (s) { return s.trim(); })
+      .filter(function (s) { return s.length > 0; });
+    let en = '', zh = '';
+    for (const line of lines) {
+      if (!zh && CJK.test(line)) { zh = line; continue; }
+      if (!en && /[A-Za-z]{2}/.test(line) && !CJK.test(line) && line.length <= 80) { en = line; }
+    }
+    return { en: en, zh: zh };
+  };
+  const wrapRows = Array.from(document.querySelectorAll('.record-button-wrap'));
+  for (const wrap of wrapRows) {
+    const row = wrap.closest('.oral-study-sentence') || wrap.closest('.record-button-group') ||
+      wrap.parentElement;
+    if (!row) { continue; }
+    const text = rowText(row);
+    const audio = wrap.querySelector('audio');
+    const fromAudio = audio ? decodeName(audio.getAttribute('src') || '') : '';
+    push(fromAudio || text.en, text.zh);
+  }
+  // 词汇表/单词列表这类不走录音组件的结构
+  const listRows = Array.from(document.querySelectorAll(
+    '.vocabulary-list li, .word-list li, .vocab-list li, .vocabulary-item, .word-item'));
+  for (const row of listRows) {
+    const text = rowText(row);
+    push(text.en, text.zh);
+  }
+  return out;
+})();
+"""
+
+# 录音题的浏览器侧支撑库：把一段音频喂给 navigator.mediaDevices.getUserMedia，
+# 页面上的录音器（chivox）拿到的就是这段音频，而不是真的麦克风。
+#
+# 关键细节：录音器开始拉流后的前 ~0.6 秒必丢块并把丢失部分补成静音，
+# 所以参考音频前面要垫 LEAD_PAD 秒静音（实测 0.8s 时逐词满分）。
+RECORD_MIC_BOOTSTRAP_JS = r"""
+(function () {
+  if (window.__ucRec) { return; }
+  const md = navigator.mediaDevices || (navigator.mediaDevices = {});
+  const api = { buf: null, ctx: null, pad: 0.8, calls: 0, dur: 0, srcDur: 0, maxDur: 0 };
+  api.ctxOf = function () {
+    const ctx = api.ctx || (api.ctx = new AudioContext());
+    try { ctx.resume(); } catch (e) {}
+    return ctx;
+  };
+  api.silent = function () {
+    return api.ctxOf().createMediaStreamDestination().stream;
+  };
+  api.stream = function () {
+    const ctx = api.ctxOf();
+    if (!api.buf) { return ctx.createMediaStreamDestination().stream; }
+    const padSec = api.pad || 0;
+    const sr = api.buf.sampleRate;
+    // 限时题（如 2 分钟自由作答）要把音频裁到时长以内，末尾做个短淡出防爆音
+    let srcFrames = api.buf.length;
+    if (api.maxDur > 0 && srcFrames > Math.round(api.maxDur * sr)) {
+      srcFrames = Math.round(api.maxDur * sr);
+    }
+    const frames = srcFrames + Math.round(padSec * sr);
+    const buf = ctx.createBuffer(api.buf.numberOfChannels, frames, sr);
+    const fade = Math.min(Math.round(0.25 * sr), Math.floor(srcFrames / 4));
+    for (let c = 0; c < api.buf.numberOfChannels; c++) {
+      const src = api.buf.getChannelData(c);
+      const dst = buf.getChannelData(c);
+      dst.set(src.subarray(0, srcFrames), Math.round(padSec * sr));
+      for (let i = 0; i < fade; i++) {
+        dst[frames - 1 - i] *= i / fade;
+      }
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const dest = ctx.createMediaStreamDestination();
+    src.connect(dest);
+    src.start();
+    api.calls += 1;
+    api.dur = buf.duration;
+    return dest.stream;
+  };
+  md.getUserMedia = function () { return Promise.resolve(api.stream()); };
+  md.getDisplayMedia = md.getDisplayMedia || function () { return Promise.resolve(api.silent()); };
+  window.__ucRec = api;
+})();
+"""
+
+RECORD_MIC_JS = r"""
+const done = arguments[arguments.length - 1];
+const b64 = arguments[0] || '';
+const pad = (typeof arguments[1] === 'number') ? arguments[1] : 0.8;
+const maxDur = (typeof arguments[2] === 'number') ? arguments[2] : 0;
+(async () => {
+  const api = window.__ucRec;
+  if (!api) { done({ ok: false, err: 'bootstrap missing' }); return; }
+  api.pad = pad;
+  api.maxDur = maxDur;
+  if (!b64) { done({ ok: true, dur: api.dur, srcDur: api.srcDur, pad: pad, reused: true }); return; }
+  const ctx = api.ctxOf();
+  const raw = atob(b64);
+  const u8 = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+  const buf = await ctx.decodeAudioData(u8.buffer);
+  api.buf = buf;
+  api.srcDur = buf.duration;
+  const usable = maxDur > 0 ? Math.min(buf.duration, maxDur) : buf.duration;
+  api.dur = usable + pad;
+  done({ ok: true, dur: api.dur, srcDur: api.srcDur, sr: buf.sampleRate, pad: pad, maxDur: maxDur });
+})().catch((e) => done({ ok: false, err: String(e) }));
+"""
+
+RECORD_ITEMS_JS = r"""
+const root = arguments[0] || document;
+const tidy = function (value) {
+  let text = (value || '');
+  for (const mark of ['(w)', '(W)', '(s)', '(S)']) {
+    text = text.split(mark).join(' ');
+  }
+  return text.split(' ').filter(function (part) { return part.length > 0; })
+    .join(' ').trim();
+};
+const oneLine = function (value) {
+  const parts = (value || '').split(String.fromCharCode(10));
+  const out = [];
+  for (const part of parts) {
+    const clean = tidy(part);
+    if (clean) { out.push(clean); }
+  }
+  return out.join(' ');
+};
+const audioOf = function (scope) {
+  if (!scope) { return null; }
+  let nodes = [];
+  try { nodes = Array.from(scope.querySelectorAll('audio')); } catch (e) { nodes = []; }
+  const usable = nodes.filter(function (audio) {
+    if (audio.closest('.audio-replay')) { return false; }
+    const src = audio.getAttribute('src') || audio.getAttribute('data-src') ||
+      audio.getAttribute('title') || '';
+    return src.indexOf('http') === 0 || src.indexOf('data:') === 0;
+  });
+  const origin = usable.find(function (audio) {
+    return !!audio.closest('.question-audio');
+  });
+  return origin || usable[0] || null;
+};
+return Array.from(arguments[1]).map(function (button) {
+  const wrap = button.closest('.record-button-wrap');
+  const paragraph = button.closest('.oral-paragraph-container');
+  const group = button.closest('.record-button-group');
+  // 口语回答这类题（oral-personal-state）：题干在 oral-container 里，
+  // 录音区里只有倒计时和「点击按钮，结束录音」提示，不能拿来当题名。
+  const oralBox = button.closest('.oral-personal-state-wrapper');
+  const row = button.closest('.oral-study-sentence') || paragraph || root;
+  let audio = null;
+  for (const scope of [paragraph, group, row]) {
+    audio = audioOf(scope);
+    if (audio) { break; }
+  }
+  if (!audio) { audio = audioOf(wrap); }
+  const song = (group && group.querySelector('.question-audio.audio-origin')) ||
+    (row && row.querySelector('.question-audio.audio-origin'));
+  const raw = audio
+    ? (audio.getAttribute('src') || audio.getAttribute('data-src') ||
+       audio.getAttribute('title') || '')
+    : (song ? (song.getAttribute('title') || '') : '');
+  let passage = null;
+  for (const scope of [paragraph, row]) {
+    if (!scope) { continue; }
+    passage = scope.querySelector('.sentence-html-container') ||
+      scope.querySelector('.oral-personal-state-sentence-container');
+    if (passage) { break; }
+  }
+  const text = passage ? oneLine(passage.innerText || passage.textContent || '') : '';
+  // 口语题的问题题干只能当题名/签名。写进 text 会优先于 AI 稿件被当成“朗读原文”。
+  const promptBox = oralBox ? oralBox.querySelector('.oral-personal-state-oral-container') : null;
+  const promptText = promptBox
+    ? oneLine(promptBox.innerText || promptBox.textContent || '') : '';
+  let lines = [];
+  if (row) {
+    lines = (row.innerText || '').split(String.fromCharCode(10))
+      .map(function (part) { return tidy(part); })
+      // 倒计时与录音提示不是题名，拾到会把“03:00”当成题干。
+      .filter(function (part) {
+        return part.length > 0 && !/^\d{1,2}:\d{2}$/.test(part) &&
+          part.indexOf('点击按钮') === -1 && part.indexOf('结束录音') === -1;
+      });
+  }
+  const rows = Array.from(document.querySelectorAll('.oral-study-sentence'));
+  return {
+    raw: raw,
+    name: text || promptText || (lines.length ? lines[0] : ''),
+    text: text,
+    // 单独给出稳定题干，供签名使用：name 末位可能是播放器状态文案。
+    prompt: promptText,
+    lines: lines.slice(0, 4),
+    src: song ? (song.getAttribute('title') || '') : '',
+    rowIndex: rows.indexOf(row)
+  };
+});
+"""
+
+RECORD_ROW_STATE_JS = r"""
+return (function (root, idx, selectors) {
+  const blank = { text: '', score: null, stop: false, wave: '', recorded: false,
+                  htmlLen: 0, blob: 0, uploaded: 0 };
+  if (!root) { return blank; }
+  const sel = (selectors && selectors.length) ? selectors.join(',') : '.record-icon.button-record';
+  let rows;
+  try {
+    rows = (root.matches && root.matches('.oral-study-sentence'))
+      ? [root]
+      : Array.from(root.querySelectorAll('.oral-study-sentence'));
+  } catch (e) { rows = []; }
+  if (!rows.length) {
+    try {
+      rows = (root.matches && root.matches('.question-common-abs-reply > .item'))
+        ? [root]
+        : Array.from(root.querySelectorAll('.question-video-dub-pc .question-common-abs-reply > .item'));
+    } catch (e) { rows = []; }
+  }
+  if (!rows.length) {
+    try { rows = Array.from(root.querySelectorAll('.record-button-group')); } catch (e) { rows = []; }
+  }
+  if (!rows.length) { rows = [root]; }
+  const row = rows[idx] || rows[0];
+  if (!row) { return blank; }
+  // Exercise 2 这类自由作答的分数与回放挂在再上一层 .p-oral-personal-state 上，
+  // 麦克风按钮所在的 .record-button-group 里什么都没有，所以要看更大的作用域。
+  // 但只有「整块里就一个录音按钮」时才上扩，避免跟读题多行共用外层时串分。
+  let scope = row;
+  const outer = row.closest('.oral-paragraph-container, .p-oral-personal-state');
+  if (outer && !row.querySelector('.score_layout') &&
+      outer.querySelectorAll(sel).length === 1) {
+    scope = outer;
+  }
+  const node = row.querySelector('.score_layout') ||
+    (row.matches && row.matches('.item') ? row.querySelector('.score') : null) ||
+    scope.querySelector('.score_layout');
+  const text = node ? ((node.innerText || node.textContent || '').trim()) : '';
+  const match = text.match(/(\d{1,3})/);
+  const icon = row.querySelector(sel);
+  // 录音中图标会换成实心方块，空闲时 svg 里只有一个 opacity=0 的 rect
+  const stop = !!(icon && icon.querySelector('svg rect[fill="currentColor"]'));
+  const waveNode = scope.querySelector('.audio-control-box.audio-control-wave');
+  // 录完之后平台会上传音频并给一个可回放的 <audio src="http://...mp3">；
+  // 题目自带原声放在 .record-button-wrap 里，不能算作答结果。
+  const audios = Array.from(scope.querySelectorAll('audio')).filter(function (a) {
+    if (a.closest('.paragraphPlayerContainer')) { return false; }
+    if (a.closest('.record-button-wrap') && !a.closest('.audio-replay')) { return false; }
+    return ((a.getAttribute('src') || '').length > 0);
+  });
+  const blob = audios.filter(function (a) {
+    const src = a.getAttribute('src') || '';
+    return src.indexOf('blob:') === 0 || src.indexOf('data:') === 0;
+  }).length;
+  const uploaded = audios.length - blob;
+  return {
+    text: text,
+    score: match ? parseInt(match[1], 10) : null,
+    stop: stop,
+    wave: waveNode ? waveNode.className : '',
+    recorded: (blob + uploaded) > 0,
+    htmlLen: (scope.innerHTML || '').length,
+    blob: blob,
+    uploaded: uploaded
+  };
+})(arguments[0], arguments[1], arguments[2]);
+"""
+ORAL_ALOUD_STATE_JS = r"""
+const score = document.querySelector('.score_layout');
+const btn = document.querySelector('.p-oral-aloud-button');
+const timer = document.querySelector('.count-down-time');
+const text = score ? (score.innerText || '').replace(/[^0-9.]/g, '') : '';
+return {
+    score: text,
+    btn: btn ? (btn.innerText || '').replace(/\s+/g, ' ').trim() : '',
+    timer: timer ? (timer.innerText || '').trim() : '',
+    recording: !!document.querySelector('[class*="record-sentence-container"]'),
+    done: !!document.querySelector('.p-oral-aloud [class*="luyin"], .p-oral-aloud [class*="huifang"]')
+};
+"""
+
+
+RECORD_STATE_JS = r"""
+return (function () {
+  // 调试/自检用：整页录音题的状态快照（每条分数、波形按钮态、注入调用次数）
+  const rows = Array.from(document.querySelectorAll('.oral-study-sentence, .record-button-group'));
+  const pick = (row) => {
+    const score = row.querySelector('.score_layout');
+    const wave = row.querySelector('.audio-control-box.audio-control-wave');
+    return {
+      score: score ? (score.innerText || score.textContent || '').trim() : '',
+      wave: wave ? (wave.className || '') : '',
+      text: (row.innerText || '').trim().slice(0, 80).replace(/\s+/g, ' '),
+    };
+  };
+  return {
+    rows: rows.map(pick),
+    buttons: document.querySelectorAll('.record-icon.button-record').length,
+    calls: (window.__ucRec && window.__ucRec.calls) || 0,
+  };
+})();
+"""
+
+
+class TTSEngine:
+    """录音题的语音合成：把文字变成可以冒充麦克风的音频。
+
+    Vocabulary / Exercise 1 的跟读题页面自带原声，直接借原声即可；Exercise 2 这类
+    主观题只有一个计时录音按钮，没有原声可用，只能先让模型写一段口语稿，再合成成
+    语音喂进麦克风轨道。这里做两套后端：
+
+    - edge：微软在线朗读（自然度最高，需要联网，可走代理）；
+    - sapi：Windows 自带 System.Speech（离线，机器味重但永远可用）。
+
+    两者产出的格式（mp3 / wav）浏览器 decodeAudioData 都能直接解。
+    """
+
+    EDGE_VOICE = "en-US-AriaNeural"
+    EDGE_FAILURE_LIMIT = 2
+    CACHE_LIMIT = 16
+    WORDS_PER_SECOND = 2.4  # 正常语速，用来估算「这段话要不要裁」
+    SAPI_RATE = 0
+
+    def __init__(self, engine: str = "auto", voice: str = "", proxy: str = "", rate: str = "+0%"):
+        self.engine = (engine or "auto").strip().lower()
+        self.voice = (voice or "").strip()
+        self.proxy = (proxy or os.environ.get("UNIPUS_TTS_PROXY", "") or "").strip()
+        self.rate = rate or "+0%"
+        self.last_error = ""
+        self._edge_failures = 0
+        self._cache: Dict[str, Tuple[str, bytes]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return self.engine not in ("off", "none", "disable", "disabled")
+
+    def synthesize(self, text: str, max_seconds: float = 110.0) -> Tuple[str, bytes]:
+        """合成音频，返回 (格式, 字节)；失败返回 ("", b"")，原因写在 last_error。"""
+        if not self.enabled:
+            self.last_error = "TTS 已在配置里关闭"
+            return "", b""
+
+        spoken = self.prepare_text(text, max_seconds)
+        if not spoken:
+            self.last_error = "没有可朗读的英文文本"
+            return "", b""
+
+        key = hashlib.md5(f"{spoken}|{self.voice}|{self.rate}".encode()).hexdigest()
+        cached = self._cache.get(key)
+        if cached:
+            print(f"    TTS 复用缓存（{len(spoken.split())} 词）")
+            return cached
+
+        errors = []
+        for name in self._engine_order():
+            fmt, data = self._run_engine(name, spoken)
+            if data:
+                if len(self._cache) >= self.CACHE_LIMIT:
+                    self._cache.clear()
+                self._cache[key] = (fmt, data)
+                print(f"    TTS({name}) 合成 {len(spoken.split())} 词 / {len(data)} 字节")
+                return fmt, data
+            errors.append(f"{name}: {self.last_error}")
+        self.last_error = "; ".join(e for e in errors if e)
+        return "", b""
+
+    def _engine_order(self) -> Tuple[str, ...]:
+        if self.engine in ("sapi", "system", "windows"):
+            return ("sapi",)
+        if self.engine == "edge":
+            return ("edge",)
+        return ("edge", "sapi")
+
+    def _run_engine(self, name: str, text: str) -> Tuple[str, bytes]:
+        try:
+            if name == "edge":
+                return self._synth_edge(text)
+            return self._synth_sapi(text)
+        except Exception as exc:
+            self.last_error = f"{name} 合成异常: {str(exc)[:120]}"
+            logger.error("TTS 合成失败", exc_info=True)
+            return "", b""
+
+    # ---- 文本预处理 ------------------------------------------------------
+    def prepare_text(self, text: str, max_seconds: float = 110.0) -> str:
+        """清掉 markdown / 中文说明，并按语速把过长稿子裁到时长以内。"""
+        raw = (text or '').replace('\r', '\n')
+        # 只摘掉围栏本身，保留里面的正文：模型常把整篇口语稿包在 ``` 里
+        raw = re.sub(r'^[ \t]*```[a-zA-Z]*[ \t]*$', '', raw, flags=re.M)
+        raw = re.sub(r'```', ' ', raw)
+        raw = re.sub(r'[*_`#>]+', ' ', raw)
+
+        kept = []
+        for line in raw.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            # 纯中文行（模型的解释、译文）不朗读
+            if not re.search(r'[A-Za-z]{2}', line):
+                continue
+            line = re.sub(r'^[\s\-–—•\d]+[.、)）:：]\s*', '', line)
+            kept.append(line)
+        spoken = ' '.join(kept)
+        spoken = re.sub(r'[（(][^）)]*[\u4e00-\u9fa5][^）)]*[）)]', ' ', spoken)
+        spoken = re.sub(r'\s+', ' ', spoken).strip()
+        if not spoken:
+            return ""
+        return self._trim_to_seconds(spoken, max_seconds)
+
+    def _trim_to_seconds(self, text: str, max_seconds: float) -> str:
+        budget = int(max(15.0, float(max_seconds or 0)) * self.WORDS_PER_SECOND)
+        words = text.split()
+        if len(words) <= budget:
+            return text
+
+        clipped = ' '.join(words[:budget])
+        # 尽量在句末切开，免得半句话被截断
+        end = max(clipped.rfind('. '), clipped.rfind('! '), clipped.rfind('? '))
+        if end >= len(clipped) * 0.6:
+            clipped = clipped[:end + 1]
+        return clipped.strip()
+
+    # ---- edge-tts --------------------------------------------------------
+    def _synth_edge(self, text: str) -> Tuple[str, bytes]:
+        if self._edge_failures >= self.EDGE_FAILURE_LIMIT:
+            self.last_error = "edge-tts 连续失败，本轮改用离线引擎"
+            return "", b""
+        try:
+            import edge_tts  # 可选依赖：pip install edge-tts
+        except Exception:
+            self._edge_failures = self.EDGE_FAILURE_LIMIT
+            self.last_error = "未安装 edge-tts（pip install edge-tts 后自动启用）"
+            return "", b""
+
+        voice = self.voice or self.EDGE_VOICE
+        path = os.path.join(tempfile.gettempdir(),
+                            f"unipus_tts_{int(time.time() * 1000)}_{random.randint(100, 999)}.mp3")
+        kwargs = {"rate": self.rate}
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
+        try:
+            try:
+                self._edge_save(edge_tts, text, voice, path, kwargs)
+            except TypeError:
+                # 老版本 Communicate 不收 proxy/rate，退一步只传文本和音色
+                self._edge_save(edge_tts, text, voice, path, {})
+            with open(path, 'rb') as handle:
+                data = handle.read()
+            if not data:
+                raise RuntimeError("edge-tts 返回空音频")
+            self._edge_failures = 0
+            return "mp3", data
+        except Exception as exc:
+            self._edge_failures += 1
+            self.last_error = f"edge-tts 合成失败: {str(exc)[:120]}"
+            return "", b""
+        finally:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _edge_save(edge_tts, text: str, voice: str, path: str, kwargs: Dict[str, Any]):
+        import asyncio
+
+        async def run():
+            communicate = edge_tts.Communicate(text, voice, **kwargs)
+            await communicate.save(path)
+
+        asyncio.run(run())
+
+    @staticmethod
+    def _decode_console(raw: bytes) -> str:
+        """控制台输出可能是 UTF-8，也可能是 GBK/系统代码页，逐个试。"""
+        for encoding in ('utf-8', 'mbcs', 'gbk'):
+            try:
+                return raw.decode(encoding)
+            except Exception:
+                continue
+        return raw.decode('utf-8', 'ignore')
+
+    # ---- Windows SAPI ----------------------------------------------------
+    def _synth_sapi(self, text: str) -> Tuple[str, bytes]:
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell:
+            self.last_error = "未找到 powershell，无法使用 Windows 语音合成"
+            return "", b""
+
+        stamp = f"{int(time.time() * 1000)}_{random.randint(100, 999)}"
+        txt_path = os.path.join(tempfile.gettempdir(), f"unipus_tts_{stamp}.txt")
+        wav_path = os.path.join(tempfile.gettempdir(), f"unipus_tts_{stamp}.wav")
+        with open(txt_path, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+
+        script = SAPI_TTS_SCRIPT.replace('__RATE__', str(int(self.SAPI_RATE)))
+        env = dict(os.environ)
+        env['UNIPUS_TTS_TEXT'] = txt_path
+        env['UNIPUS_TTS_OUT'] = wav_path
+        env['UNIPUS_TTS_VOICE'] = self.voice
+
+        creation_flags = 0x08000000 if os.name == 'nt' else 0
+        try:
+            completed = subprocess.run(
+                [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-Command", script],
+                capture_output=True, timeout=180, env=env,
+                creationflags=creation_flags,
+            )
+            if completed.returncode != 0:
+                detail = self._decode_console(completed.stderr or completed.stdout or b'')
+                self.last_error = f"SAPI 失败: {detail.strip()[:160]}"
+                return "", b""
+            with open(wav_path, 'rb') as handle:
+                data = handle.read()
+            if not data:
+                self.last_error = "SAPI 返回空音频"
+                return "", b""
+            return "wav", data
+        except Exception as exc:
+            self.last_error = f"SAPI 异常: {str(exc)[:120]}"
+            return "", b""
+        finally:
+            for path in (txt_path, wav_path):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+
+
+SAPI_TTS_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Speech
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try { $synth.Rate = __RATE__ } catch { }
+$installed = @($synth.GetInstalledVoices())
+
+$candidates = New-Object System.Collections.ArrayList
+if ($env:UNIPUS_TTS_VOICE) { [void]$candidates.Add($env:UNIPUS_TTS_VOICE) }
+foreach ($item in $installed) {
+  if ($item.Enabled -and $item.VoiceInfo.Culture.Name -like 'en*') {
+    [void]$candidates.Add($item.VoiceInfo.Name)
+  }
+}
+foreach ($item in $installed) {
+  if ($item.Enabled) { [void]$candidates.Add($item.VoiceInfo.Name) }
+}
+
+foreach ($name in $candidates) {
+  if (-not $name) { continue }
+  try { $synth.SelectVoice($name); break } catch { }
+}
+
+$text = [System.IO.File]::ReadAllText($env:UNIPUS_TTS_TEXT, [System.Text.Encoding]::UTF8)
+$synth.SetOutputToWaveFile($env:UNIPUS_TTS_OUT)
+$synth.Speak($text)
+$synth.Dispose()
+"""
+
+
+class VocabularyReadAloudStrategy(QuestionParserStrategy):
+    """New words / Phrases and expressions 词汇跟读卡片。
+
+    DOM：.vocabulary-wrapper > .vocContainer .swiper-container > .swiper-slide-active，
+    词在 .vocWord .component-htmlview，原声在 .soundWrap .question-audio audio，
+    按钮是 .ucomp-recorder .button-record，进度在 .progressBar .ratio。
+
+    这页的答案就是卡片上印着的单词/短语，且自带 1.2 秒原声，因此
+    record_items 同时带 url 与 text，让 needs_speech_script 恒为 False，
+    完全不触发「AI 写口语稿 + TTS 录 90 秒」那条链路。
+    """
+
+    def can_parse(self, container, driver) -> bool:
+        try:
+            if container.find_elements(By.CSS_SELECTOR, VOCAB_READ_ALOUD_SELECTOR):
+                return True
+            return bool(container.find_elements(By.CSS_SELECTOR, '.vocContainer .vocWord'))
+        except Exception:
+            return False
+
+    def parse(self, container, driver, question_number: int,
+              directions: str = "") -> Optional[Question]:
+        try:
+            info = driver.execute_script(VOCAB_CARD_JS, container) or {}
+        except Exception:
+            info = {}
+        word = (info.get('word') or '').strip()
+        raw = info.get('audio') or ''
+        url = raw.split('#')[0].strip()
+        item = {
+            'index': 0,
+            'url': url,
+            'name': word or (info.get('name') or ''),
+            'duration': float(info.get('duration') or 0),
+            'text': word,
+            'lines': [],
+            'element': None,
+            'needs_tts': not url,
+            'vocab': True,
+            'vocab_total': int(info.get('total') or 0),
+            'vocab_index': int(info.get('index') or 0),
+        }
+        text = word or '词汇跟读'
+        definition = (info.get('definition') or '').strip()
+        if definition:
+            text += '\n' + definition[:200]
+        if directions:
+            text = directions.strip() + '\n' + text
+        print(f"    词汇跟读卡片: {word or '(未读到)'} | "
+              f"原声 {'有' if url else '无'} | "
+              f"进度 {item['vocab_index']}/{item['vocab_total']}")
+        return Question(
+            number=question_number,
+            text=text[:1200],
+            q_type=QuestionType.RECORD,
+            element=container,
+            directions=directions,
+            record_items=[item],
+        )
+
+
+class OralAloudStrategy(QuestionParserStrategy):
+    """整段朗读题（3-8 Unit test 的 Passage speaking）
+
+    页面只给一段文章，点 start 后先强制准备 2 分钟，再强制录一遍音；录音结束才出分，
+    之后才是可以手动重录的界面。自动化只需要一次动作：准备阶段就把 TTS 音频装进
+    假麦克风，强制录音一开始平台录到的就是整段朗读。
+    """
+
+    CONTAINER_SELECTOR = '.p-oral-aloud'
+
+    def can_parse(self, container, driver) -> bool:
+        try:
+            return bool(container.find_elements(By.CSS_SELECTOR, '.p-oral-aloud-button'))
+        except Exception:
+            return False
+
+    def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
+        text = ''
+        for selector in ('.p-oral-aloud-sentence .component-htmlview',
+                         '.p-oral-aloud-content .component-htmlview',
+                         '.p-oral-aloud-sentence'):
+            try:
+                nodes = container.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                nodes = []
+            for node in nodes:
+                value = (node.text or '').strip()
+                if len(value) > 40:
+                    text = re.sub(r'\s+', ' ', value)
+                    break
+            if text:
+                break
+        if not text:
+            return None
+        return Question(
+            number=question_number,
+            text=text,
+            q_type=QuestionType.ORAL_ALOUD,
+            element=container,
+            directions=directions,
+            record_items=[{'url': '', 'name': '', 'text': text, 'duration': 0.0}],
+        )
+
+
+class RecordStrategy(QuestionParserStrategy):
+    """跟读/朗读录音题（course-v2 播放器 .oral-study-sentence）
+
+    新版视听说教材的 Vocabulary、Exercise 里有一类题型：页面上给一句英文和它的
+    原声，要求"听并跟读"，每条右侧是一个麦克风按钮。做题方式不是填输入框，而是
+    让浏览器录一段音交给腾讯智聆（SOE）打分——所以只能走「把参考音频冒充成麦克风
+    输入」这条路，不需要 TTS、也不需要真的说话。
+    """
+
+    def can_parse(self, container, driver) -> bool:
+        try:
+            if container.find_elements(By.CSS_SELECTOR, RECORD_BUTTON_SELECTOR):
+                return True
+        except Exception:
+            pass
+        return bool(find_record_buttons(driver, container))
+
+    def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
+        buttons = find_record_buttons(driver, container)
+        if not buttons:
+            return None
+
+        # 参考音频挂在 .record-button-wrap 里的 <audio>，src 后面带
+        # #duration=..&name=..，这里一次性用 JS 读出来，比多层 XPath 稳。
+        try:
+            metas = driver.execute_script(
+                RECORD_ITEMS_JS, container, buttons) or []
+        except Exception:
+            metas = []
+
+        items = []
+        for idx, button in enumerate(buttons):
+            meta = {'index': idx, 'url': '', 'name': '', 'duration': 0.0,
+                    'lines': [], 'element': button}
+            if idx < len(metas):
+                info = metas[idx] or {}
+                raw = (info.get('raw') or '') or (info.get('src') or '')
+                meta['url'] = raw.split('#')[0].strip()
+                match = re.search(r'name=([^&]*)', raw)
+                if match:
+                    meta['name'] = self._decode_audio_name(match.group(1))
+                match = re.search(r'duration=([0-9.]+)', raw)
+                if match:
+                    meta['duration'] = float(match.group(1))
+                lines = [str(line).strip() for line in (info.get('lines') or []) if str(line).strip()]
+                meta['lines'] = lines
+                meta['text'] = (info.get('text') or '').strip()
+                meta['prompt'] = (info.get('prompt') or '').strip()
+                # 记下行号，按钮被 React 换掉后按行重定位。
+                try:
+                    row_index = int(info.get('rowIndex'))
+                except (TypeError, ValueError):
+                    row_index = -1
+                if row_index >= 0:
+                    meta['row_index'] = row_index
+                if not meta['name']:
+                    meta['name'] = (info.get('name') or '').strip()
+            if not meta['name']:
+                meta['name'] = (button.get_attribute('title') or '').strip()
+            # 段落跟读优先用样音；无样音时只朗读给定段落，不生成新稿。
+            meta['needs_tts'] = not meta['url']
+            items.append(meta)
+
+        if not items:
+            return None
+
+        text = self._question_text(container, items, directions)
+
+        return Question(
+            number=question_number,
+            text=text,
+            q_type=QuestionType.RECORD,
+            element=container,
+            directions=directions,
+            record_items=items,
+        )
+
+    @staticmethod
+    def _decode_audio_name(raw: str) -> str:
+        try:
+            return unquote(raw).strip()
+        except Exception:
+            return (raw or '').strip()
+
+    @staticmethod
+    def _question_text(container, items: List[Dict], directions: str) -> str:
+        """题目要求（题目本身 + 指示），供没有原声的录音题写口语稿用。
+
+        Exercise 2 这类主观题的结构是
+        `.p-oral-personal-state > .oral-personal-state-wrapper > (题干段落 | .record-button-group)`，
+        麦克风按钮所在的 `.record-button-group` 只是兄弟节点的一部分，题干在它上面一层，
+        所以先在本层找，找不到再往上两三层找。
+        """
+        prompt_selectors = ('.oral-personal-state-sentence-container',
+                            '.component-htmlview',
+                            '.sentence-html-container',
+                            '.question-title', '.topic-title',
+                            '.layoutBody-title', '.direction-content')
+
+        candidates = []
+        scopes = [container]
+        for xpath in ("ancestor::div[contains(@class,'oral-personal-state-wrapper')][1]",
+                      "ancestor::div[contains(@class,'question-abs-question')][1]"):
+            try:
+                scopes.append(container.find_element(By.XPATH, xpath))
+            except Exception:
+                continue
+
+        for scope in scopes:
+            for selector in prompt_selectors:
+                try:
+                    nodes = scope.find_elements(By.CSS_SELECTOR, selector)
+                except Exception:
+                    continue
+                for node in nodes:
+                    value = (node.text or '').strip()
+                    if value and value not in candidates:
+                        candidates.append(value)
+            if candidates:
+                break
+
+        if not candidates:
+            try:
+                body_text = (container.text or '').strip()
+            except Exception:
+                body_text = ''
+            if body_text:
+                candidates.append(body_text)
+        if directions:
+            candidates.insert(0, directions.strip())
+
+        joined = "\n".join(c for c in candidates if c)
+        if joined:
+            return joined[:1200]
+        if items and items[0].get('name'):
+            return items[0]['name']
+        return "录音题（跟读/自由作答）"
+
+
+class VideoDubStrategy(QuestionParserStrategy):
+    """视频配音题：一个视频 + 多条字幕，每条单独录音。"""
+
+    CONTAINER_SELECTOR = '.question-video-dub-pc'
+    ROW_SELECTOR = '.question-common-abs-reply > .item'
+
+    def can_parse(self, container, driver) -> bool:
+        try:
+            if not container.find_elements(By.CSS_SELECTOR, self.ROW_SELECTOR):
+                return False
+            return bool(container.find_elements(
+                By.CSS_SELECTOR, '.ucomp-recorder .button-record, .record-button-group'))
+        except Exception:
+            return False
+
+    def parse(self, container, driver, question_number: int,
+              directions: str = "") -> Optional[Question]:
+        # 容器可能是外层节点，收敛到配音题本身。
+        if not container.find_elements(By.CSS_SELECTOR, self.ROW_SELECTOR):
+            try:
+                container = container.find_element(By.CSS_SELECTOR, self.CONTAINER_SELECTOR)
+            except Exception:
+                return None
+
+        rows = container.find_elements(By.CSS_SELECTOR, self.ROW_SELECTOR)
+        items = []
+        for idx, row in enumerate(rows):
+            try:
+                text = (row.find_element(
+                    By.CSS_SELECTOR, '.component-htmlview').text or '').strip()
+            except Exception:
+                text = ''
+            if not text:
+                continue
+            items.append({
+                'index': idx,
+                'text': text,
+                'name': text,
+                'url': '',
+                'duration': 0.0,
+                'needs_tts': True,
+                'element': row,
+                'row_index': idx,
+            })
+        if not items:
+            return None
+
+        title = f"视频配音（共{len(items)}句）"
+        text = f"【题目要求】{directions}\\n\\n{title}" if directions else title
+        return Question(
+            number=question_number,
+            text=text,
+            q_type=QuestionType.RECORD,
+            element=container,
+            directions=directions,
+            record_items=items,
+        )
+
+
 class TextInputStrategy(QuestionParserStrategy):
     """文本输入题策略"""
 
@@ -1587,7 +3177,7 @@ class TextInputStrategy(QuestionParserStrategy):
                 if is_writing:
                     full_text += f"【写作提纲/材料】\n{material_text[:500]}\n\n"
                 else:
-                    full_text += f"【阅读材料】\n{material_text[:800]}...\n\n（文章较长，根据问题回答即可）\n\n"
+                    full_text += f"【阅读材料】\n{material_text[:6000]}\n\n"
 
             full_text += "【问题列表】\n"
             for item in items:
@@ -1686,15 +3276,17 @@ class ListeningFillInStrategy(QuestionParserStrategy):
 
         blank_contexts = []
         for i, inp in enumerate(inputs):
+            scoop = None
             try:
                 scoop = inp.find_element(By.XPATH, './ancestor::span[@class="fe-scoop"]')
                 sentence = self._extract_blank_sentence(scoop)
-            except:
+            except Exception:
                 sentence = ""
             left_context, right_context = self._split_blank_context(sentence, i + 1)
             blank_contexts.append({
                 'index': i,
                 'sentence': sentence,
+                'label': self._extract_row_label(scoop, sentence) if scoop is not None else '',
                 'left_context': left_context,
                 'right_context': right_context,
                 'input': inp
@@ -1724,6 +3316,23 @@ class ListeningFillInStrategy(QuestionParserStrategy):
             except:
                 continue
         return ""
+
+    @staticmethod
+    def _extract_row_label(scoop, sentence: str) -> str:
+        """表格题的行标题（如 Opening date），模型靠它才知道该填哪种信息。"""
+        if scoop is None:
+            return ""
+        try:
+            cells = scoop.find_elements(By.XPATH, './ancestor::tr[1]/*[self::td or self::th]')
+        except Exception:
+            return ""
+        if len(cells) < 2:
+            return ""
+        try:
+            label = (cells[0].text or "").strip()
+        except Exception:
+            return ""
+        return "" if label == sentence else label
 
     @staticmethod
     def _split_blank_context(sentence: str, blank_number: int) -> Tuple[str, str]:
@@ -1756,6 +3365,12 @@ class FillInStrategy(QuestionParserStrategy):
     ]
 
     def can_parse(self, container, driver) -> bool:
+        # 先看空位：搭配填空（un____ la____）也是 .fe-scoop，不能因为页面上有材料就整页放弃
+        scoops = container.find_elements(By.CSS_SELECTOR, '.fe-scoop input:not([type="hidden"])')
+        has_options = container.find_elements(By.CSS_SELECTOR, '.option-wrapper .option, .banked-options')
+        if scoops and not has_options:
+            return True
+
         has_material_container = container.find_elements(
             By.CSS_SELECTOR, '.layout-material-container'
         )
@@ -1787,18 +3402,110 @@ class FillInStrategy(QuestionParserStrategy):
         text = title_elem.text.strip() if title_elem else ""
         text = re.sub(r"^\d+[.、)\]]\s*", "", text)
 
-        inputs = WebDriverHelper.safe_find_elements(driver, self.FILL_INPUTS, container)
-        inputs.sort(key=lambda x: int(
-            x.find_element(By.XPATH, './ancestor::span[@class="fe-scoop"]').get_attribute('data-scoop-index') or 0))
+        scoops = container.find_elements(By.CSS_SELECTOR, '.fe-scoop input:not([type="hidden"])')
+        if scoops:
+            inputs = MatchingStrategy._sort_inputs(scoops)
+        else:
+            inputs = WebDriverHelper.safe_find_elements(driver, self.FILL_INPUTS, container)
+        # 播放器会把其它练习/其它 Tab 的题也留在 DOM 里，必须只取当前可见的空位
+        visible_inputs = []
+        for inp in inputs:
+            try:
+                if inp.getClientRects():
+                    visible_inputs.append(inp)
+            except Exception:
+                continue
+        if visible_inputs:
+            inputs = visible_inputs
+
+        blanks = []
+        segments = MatchingStrategy._container_segments(driver, container)
+        for index, inp in enumerate(inputs):
+            context = MatchingStrategy._text_before_blank(driver, container, inp, segments)
+            context = re.sub(r'\s+', ' ', context).strip()
+            if not context:
+                context = MatchingStrategy._statement_for(inp)
+            # 只要空位附近的一小段，避免把整段文章都塞给模型
+            context = context[-180:] if len(context) > 180 else context
+            blanks.append({
+                'index': index,
+                'context': context,
+                'right_context': (
+                    MatchingStrategy._leading_text(inp).get('trailing') or ''
+                ).strip(),
+                'hint': MatchingStrategy._hint_before(inp),
+                'input': inp,
+            })
+
+        header = f"填空题（共{len(inputs)}个空）"
+        material = self._page_material(container)
+        if material:
+            header += f"\n【题面/词库】{material}"
+        if directions:
+            header = f"【题目要求】{directions}\n{header}"
 
         return Question(
             number=question_number,
-            text=text,
+            text=header,
             q_type=QuestionType.FILL_IN,
             element=container,
             inputs=inputs,
+            banked_blanks=blanks,
             directions=directions,
         )
+
+    @staticmethod
+    def _page_material(container, limit: int = 6000) -> str:
+        """取当前可见题面（含词库），让模型知道可选的搭配/单词表。
+
+        Directions 和词库都排在题面最前面，原来用 text[-limit:] 从尾部截断，
+        Expressions in use 这类 10 句以上的题组会把整段词库切掉（模型只能盲猜）。
+        改为从头保留，并把上限放宽到能容纳整页题面。
+        """
+        try:
+            text = container.parent.execute_script("""
+                const root = arguments[0];
+                const clone = root.cloneNode(true);
+                for (const el of clone.querySelectorAll('input, textarea, .fe-scoop')) { el.remove(); }
+                return (clone.textContent || '').replace(/\\s+/g, ' ').trim();
+            """, container) or ""
+        except Exception:
+            text = ""
+        return text[:limit] if len(text) > limit else text
+
+
+class AudioStrategy(QuestionParserStrategy):
+    """只有听力材料、没有作答控件的页面。"""
+
+    ANSWER_SELECTOR = ('video, textarea, input:not([type="hidden"]), .fe-scoop, '
+                       '.question-common-abs-choice, .option, .option-wrap, '
+                       '.ant-radio-wrapper, .ant-checkbox-wrapper, '
+                       '.oral-paragraph-container, .oral-study-sentence')
+
+    def can_parse(self, container, driver) -> bool:
+        if container.find_elements(By.CSS_SELECTOR, self.ANSWER_SELECTOR):
+            return False
+        if find_record_buttons(driver, container):
+            return False
+        return bool(container.find_elements(By.CSS_SELECTOR, 'audio[src]:not([src=""]), audio source[src]'))
+
+    def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
+        return Question(number=question_number, text="音频听读页面",
+                        q_type=QuestionType.AUDIO, element=container, directions=directions)
+
+    @classmethod
+    def is_audio_only_page(cls, driver) -> bool:
+        containers = driver.find_elements(By.CSS_SELECTOR, '.layoutBody-container')
+        visible = [node for node in containers if node.is_displayed()]
+        if not visible:
+            return False
+        # 排序/填空/选择页也有音频，但不能当纯听音频页跳过转写。
+        if driver.find_elements(
+                By.CSS_SELECTOR,
+                '.sequence-view, .sortable-list-wrapper, .question-common-abs-fill, '
+                '.question-common-abs-choice, .question-common-abs-dropdown'):
+            return False
+        return all(cls().can_parse(node, driver) for node in visible)
 
 
 class VideoStrategy(QuestionParserStrategy):
@@ -1876,20 +3583,83 @@ class DropdownSelectStrategy(QuestionParserStrategy):
     """下拉选择填空题解析策略"""
 
     def can_parse(self, container, driver) -> bool:
-        selects = container.find_elements(By.CSS_SELECTOR, '.scoop-select-wrapper, select, .ant-dropdown-trigger')
-        return bool(selects)
+        selects = container.find_elements(By.CSS_SELECTOR, DROPDOWN_TRIGGER_SELECTOR)
+        return bool(selects) or has_visible_dropdown(driver, container)
+
+    @staticmethod
+    def _cloze_material(driver, container) -> str:
+        """取整页题干，把「点击选择」替换成 ____，模型才能看见空位与编号。"""
+        try:
+            raw = driver.execute_script("""
+                const clone = arguments[0].cloneNode(true);
+                const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+                let n;
+                while ((n = walker.nextNode())) {
+                    if ((n.textContent || '').trim() === '点击选择') n.textContent = ' ____ ';
+                }
+                return (clone.textContent || '').trim();
+            """, container) or ""
+        except Exception:
+            return ""
+        return re.sub(r'\s+', ' ', raw).strip()
+
+    @staticmethod
+    def _peek_dropdown_options(driver, trigger) -> List[str]:
+        """点开第一个下拉抓候选词再收起；新版 Cloze 的选项只在浮层里。"""
+        try:
+            ActionChains(driver).move_to_element(trigger).click().perform()
+            time.sleep(0.5)
+            items = driver.find_elements(By.CSS_SELECTOR,
+                                         '.ant-select-item-option, .ant-dropdown-menu-item, '
+                                         '[role="option"], li[class*="option"]')
+            options = []
+            for item in items:
+                try:
+                    if not item.is_displayed():
+                        continue
+                    label = (item.text or '').strip()
+                    if label and label != CLOZE_DROPDOWN_PLACEHOLDER and label not in options:
+                        options.append(label)
+                except Exception:
+                    continue
+            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            return options
+        except Exception:
+            return []
 
     def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
         blanks = []
         select_elements = container.find_elements(By.CSS_SELECTOR, '.scoop-select-wrapper')
+        # 新版 Cloze 没有 .scoop-select-wrapper：回退到通用探测，
+        # 否则 banked_blanks 为空会被 Question.is_interactive() 判成非交互题。
+        if not select_elements:
+            select_elements = find_dropdown_triggers(driver, container)
 
         for i, elem in enumerate(select_elements):
             context = ""
             try:
-                context_elem = elem.find_element(By.XPATH, './ancestor::li')
-                context = context_elem.text.strip()
-            except:
-                pass
+                context_elem = elem.find_element(By.XPATH,
+                                                 './ancestor::li[1] | ./ancestor::p[1]')
+                raw = driver.execute_script("""
+                    const box = arguments[0], trigger = arguments[1];
+                    const clone = box.cloneNode(true);
+                    const label = (trigger.textContent || '').trim();
+                    const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+                    let n, done = false;
+                    while ((n = walker.nextNode())) {
+                        if (!done && label && (n.textContent || '').trim() === label) {
+                            n.textContent = ' ____ ';
+                            done = true;
+                        }
+                    }
+                    return (clone.textContent || '').trim();
+                """, context_elem, elem) or ""
+                context = re.sub(r'\s+', ' ', raw).strip()
+            except Exception:
+                try:
+                    context = elem.find_element(By.XPATH, './ancestor::p[1]').text.strip()
+                except Exception:
+                    context = ""
 
             options = []
             try:
@@ -1905,7 +3675,7 @@ class DropdownSelectStrategy(QuestionParserStrategy):
                     option_elems = select.find_elements(By.TAG_NAME, 'option')
                     for opt in option_elems:
                         text = opt.text.strip()
-                        if text and text not in ['', '点击选择']:
+                        if text and text not in ['', CLOZE_DROPDOWN_PLACEHOLDER]:
                             options.append(text)
                 except:
                     pass
@@ -1921,21 +3691,623 @@ class DropdownSelectStrategy(QuestionParserStrategy):
         text = title_elem.text.strip() if title_elem else "下拉选择填空"
         if directions:
             text = directions + text
+        material = self._cloze_material(driver, container)
+        if material:
+            text += "\n【全文】" + material[:6000]
+
+        banked_options = list(dict.fromkeys(
+            opt for b in blanks for opt in b['options']))
+        if not banked_options and blanks:
+            banked_options = self._peek_dropdown_options(driver, blanks[0]['element'])
         return Question(
             number=question_number,
             text=text,
             q_type=QuestionType.DROPDOWN_SELECT,
             element=container,
             banked_blanks=blanks,
-            banked_options=list(set(opt for b in blanks for opt in b['options']))
+            banked_options=banked_options
         )
+
+
+class ParagraphMatchingStrategy(QuestionParserStrategy):
+    """段落信息匹配题（Skimming and scanning）：读字母段落，给陈述填段落字母。
+
+    DOM（Section B Extensive reading / Skimming and scanning）：
+      .layout-material-container .component-htmlview ol[upper-alpha] > li  → 段落
+      .question-common-abs-textmatch .input-wrapper
+          > input.textbox                       → 每题一个字母输入框
+          > .component-htmlview p              → 陈述文本
+
+    FillInStrategy 见到 .layout-material-container 会直接放弃；MatchingStrategy
+    只认 .fe-scoop + A-F 人物题；两者都覆盖不到本结构，必须单独识别。
+    段落字母由 CSS `list-style-type: upper-alpha` 生成、不在 textContent 里，
+    所以要按 <li> 顺序补上 A./B./… 前缀，字母池随段落数动态生成。
+    """
+
+    REPLY_SELECTOR = '.question-common-abs-textmatch .input-wrapper'
+    INPUT_SELECTOR = REPLY_SELECTOR + ' input.textbox'
+
+    def can_parse(self, container, driver) -> bool:
+        return len(container.find_elements(
+            By.CSS_SELECTOR, self.INPUT_SELECTOR)) >= 2
+
+    @staticmethod
+    def _paragraph_material(driver, container) -> Dict:
+        try:
+            raw = driver.execute_script("""
+                var root = arguments[0];
+                var scope = root.querySelector('.layout-material-container') || root;
+                var out = [], letters = [];
+                var title = scope.querySelector('.component-htmlview > p');
+                if (title) out.push((title.innerText || title.textContent || '').trim());
+                var ol = scope.querySelector('ol');
+                if (ol) {
+                    var lis = [].filter.call(ol.children, function (n) {
+                        return n.tagName === 'LI';
+                    });
+                    for (var i = 0; i < lis.length; i++) {
+                        var L = String.fromCharCode(65 + i);
+                        letters.push(L);
+                        out.push(L + '. ' + (lis[i].innerText || lis[i].textContent || '').trim());
+                    }
+                }
+                if (!out.length) out.push((scope.innerText || scope.textContent || '').trim());
+                return {text: out.join('\\n'), letters: letters};
+            """, container)
+            if not isinstance(raw, dict):
+                return {'text': '', 'letters': []}
+            text = re.sub(r'\n{3,}', '\n\n', raw.get('text') or '').strip()
+            return {'text': text, 'letters': raw.get('letters') or []}
+        except Exception:
+            return {'text': '', 'letters': []}
+
+    @staticmethod
+    def _statements(driver, container) -> List[str]:
+        try:
+            raw = driver.execute_script("""
+                var root = arguments[0];
+                return [].map.call(
+                    root.querySelectorAll('.question-common-abs-textmatch .input-wrapper'),
+                    function (w) {
+                        var p = w.querySelector('.component-htmlview');
+                        return p ? (p.innerText || p.textContent || '').trim() : '';
+                    });
+            """, container) or []
+        except Exception:
+            return []
+        return [re.sub(r'\s+', ' ', str(s)).strip() for s in raw]
+
+    def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
+        inputs = container.find_elements(By.CSS_SELECTOR, self.INPUT_SELECTOR)
+        statements = self._statements(driver, container)
+        if len(statements) < len(inputs):
+            statements += [''] * (len(inputs) - len(statements))
+        material = self._paragraph_material(driver, container)
+        text = material.get('text') or ''
+        if directions:
+            text = '【题目要求】' + directions + '\n' + text
+        return Question(
+            number=question_number,
+            text=text,
+            q_type=QuestionType.PARAGRAPH_MATCH,
+            element=container,
+            inputs=inputs,
+            banked_options=material.get('letters') or [],
+            banked_blanks=[{'index': i, 'statement': s}
+                           for i, s in enumerate(statements[:len(inputs)])],
+            directions=directions,
+        )
+
+
+class MatchingStrategy(QuestionParserStrategy):
+    """人物 A-F ↔ 陈述 的匹配题。
+
+    典型题面（视听说 Watching street interviews - Exercise 3）：
+      Directions: ... match the people to the answers. Filling the blanks with A-F.
+      A B C D E F（照片）
+      1. the environment ___  2. poverty ___ ...
+    这类题每个空只填一个字母，旧版会把它们当成听力填空让模型写单词，必然 0 分。
+    """
+
+    MATCH_DIRECTION = re.compile(
+        r'match\s+the\s+(?:people|persons?|speakers?|statements?|answers?)'
+        r'|fill(?:ing)?\s+(?:in\s+)?the\s+blanks?\s+with\s+(?:the\s+)?(?:letters?\s+)?'
+        r'(?:[A-Z]\s*[-–—~]\s*[A-Z])'
+        r'|choose\s+the\s+correct\s+letter',
+        re.I)
+
+    @classmethod
+    def is_matching_direction(cls, directions: str) -> bool:
+        return bool(cls.MATCH_DIRECTION.search(directions or ""))
+
+    @staticmethod
+    def _page_direction(driver) -> str:
+        for selector in (
+                '.layout-direction-container .component-htmlview',
+                '.layout-direction-container',
+                '.abs-direction .content',
+                '.abs-direction'):
+            try:
+                text = driver.find_element(By.CSS_SELECTOR, selector).text.strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+        return ""
+
+    def can_parse(self, container, driver) -> bool:
+        blanks = container.find_elements(By.CSS_SELECTOR, '.fe-scoop input')
+        if len(blanks) < 2:
+            return False
+        return self.is_matching_direction(self._page_direction(driver))
+
+    def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
+        inputs = container.find_elements(By.CSS_SELECTOR, '.fe-scoop input')
+        inputs = self._sort_inputs(inputs)
+
+        segments = self._container_segments(driver, container)
+        numbered = []
+        for item in segments:
+            text = re.sub(r'\s+', ' ', (item.get('text') or '')).strip()
+            if re.match(r'^\d{1,2}\s*[.、)]', text):
+                numbered.append(self._clean_statement(text))
+
+        statements = []
+        for index, inp in enumerate(inputs):
+            hint = GenericReplyStrategy._hint_before(inp)
+            if len(numbered) == len(inputs):
+                statement = numbered[index]
+            else:
+                raw = self._text_before_blank(driver, container, inp, segments)
+                statement = self._clean_statement(re.sub(r'\s+', ' ', raw))
+            if not statement:
+                statement = self._clean_statement(re.sub(r'\s+', ' ', self._statement_for(inp)))
+            statements.append({
+                'index': index,
+                'statement': statement,
+                'hint': hint,
+                'input': inp,
+            })
+
+        letters = self._option_letters(container)
+        if not letters:
+            letters = [chr(65 + i) for i in range(min(8, max(2, len(inputs))))]
+
+        text_lines = ["【匹配题】把陈述与人物字母对应起来，每个空只填一个字母。"]
+        if directions:
+            text_lines.append(f"题目要求：{directions}")
+        text_lines.append(f"可选字母：{' / '.join(letters)}")
+        text_lines.append("陈述：")
+        for item in statements:
+            text_lines.append(f"  {item['index'] + 1}. {item['statement']}")
+
+        return Question(
+            number=question_number,
+            text="\n".join(text_lines),
+            q_type=QuestionType.MATCHING,
+            element=container,
+            inputs=inputs,
+            banked_blanks=statements,
+            banked_options=letters,
+            options=[Option(letter=letter, text="", element=None) for letter in letters],
+            directions=directions,
+        )
+
+    @staticmethod
+    def _clean_statement(segment: str) -> str:
+        """把「A B C D E F 1. the environment」清成「1. the environment」。"""
+        text = (segment or "").strip()
+        if not text:
+            return ""
+        # 去掉开头的人物字母行
+        text = re.sub(r'^(?:[A-H]\s*){2,}', '', text).strip()
+        # 只保留最后一小节（避免把前面几题重复带进来）
+        parts = re.split(r'(?=(?<!\d)\d{1,2}\s*[.、)]\s)', text)
+        parts = [p.strip() for p in parts if p.strip()]
+        if parts:
+            text = parts[-1]
+        return text[-200:]
+
+    @staticmethod
+    def _sort_inputs(inputs: List[Any]) -> List[Any]:
+        def key(inp):
+            try:
+                scoop = inp.find_element(By.XPATH, './ancestor::span[contains(@class, "fe-scoop")][1]')
+                return int(scoop.get_attribute('data-scoop-index') or 0)
+            except Exception:
+                return 0
+
+        ordered = list(inputs)
+        try:
+            ordered.sort(key=key)
+        except Exception:
+            pass
+        return ordered
+
+    @staticmethod
+    def _statement_for(inp) -> str:
+        for xpath in ('./ancestor::td[1]', './ancestor::p[1]', './ancestor::li[1]', './ancestor::div[1]'):
+            try:
+                node = inp.find_element(By.XPATH, xpath)
+                text = MatchingStrategy._node_text_without_input(node)
+                if text:
+                    return text
+            except Exception:
+                continue
+        return ""
+
+    @staticmethod
+    def _blank_context(inp, cache: Dict[int, List[str]] = None) -> Tuple[str, str]:
+        """取本空正前面的那段文字（如 "3. lack of fossil fuels"）+ 首字母提示。"""
+        data = MatchingStrategy._leading_text(inp)
+        text = (data.get('leading') or '').strip()
+        hint = (data.get('hint') or '').strip()
+        if cache is not None and 'segments' in cache and 'position' in cache:
+            segments = cache['segments']
+            position = cache['position']
+            if 0 <= position < len(segments):
+                segment = segments[position].strip()
+                if len(segment) > len(text):
+                    text = segment
+        if not text:
+            text = MatchingStrategy._statement_for(inp)
+        return text[-300:] if len(text) > 300 else text, hint
+
+    @staticmethod
+    def _container_segments(driver, container) -> List[str]:
+        """按空位切分整段题面，返回每空前面那段文字（不含空位本身的输入框）。"""
+        try:
+            return driver.execute_script("""
+                const root = arguments[0];
+                const out = [];
+                let buf = '';
+                const walk = (n) => {
+                  for (const child of n.childNodes) {
+                    if (child.nodeType === 3) { buf += child.textContent; continue; }
+                    if (child.nodeType !== 1) continue;
+                    if (child.tagName === 'INPUT') { continue; }
+                    if (child.classList && child.classList.contains('fe-scoop')) {
+                      const idx = child.getAttribute('data-scoop-index');
+                      out.push({text: buf, idx: idx === null ? null : Number(idx)});
+                      buf = '';
+                      continue;
+                    }
+                    walk(child);
+                  }
+                };
+                walk(root);
+                out.push({text: buf, idx: null});
+                return out;
+            """, container) or []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _text_before_blank(driver, container, inp, segments=None) -> str:
+        """按 data-scoop-index 找回「本空前面那段文字」。"""
+        segments = segments if segments is not None else MatchingStrategy._container_segments(driver, container)
+        if not segments or not isinstance(segments[0], dict):
+            return ""
+        try:
+            scoop = inp.find_element(By.XPATH, './ancestor::span[contains(@class, "fe-scoop")][1]')
+            index = int(scoop.get_attribute('data-scoop-index') or 0)
+        except Exception:
+            return ""
+        for item in segments:
+            if item.get('idx') == index:
+                return (item.get('text') or '').strip()
+        return ""
+
+    @staticmethod
+    def _scoop_positions(driver, container) -> List[int]:
+        try:
+            return driver.execute_script("""
+                const root = arguments[0];
+                const scoops = [...root.querySelectorAll('.fe-scoop')];
+                const result = [];
+                for (const scoop of scoops) {
+                  const input = scoop.querySelector('input');
+                  if (input) result.push(Number(scoop.getAttribute('data-scoop-index') || result.length));
+                }
+                return result;
+            """, container) or []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _leading_text(inp) -> Dict[str, str]:
+        try:
+            return inp.parent.execute_script("""
+                const input = arguments[0];
+                const scoop = input.closest('.fe-scoop');
+                if (!scoop) return {leading: '', hint: ''};
+                let node = scoop.previousSibling, out = '';
+                for (let guard = 0; guard < 12 && node; guard++) {
+                  if (node.nodeType === 1 && node.querySelector && node.querySelector('.fe-scoop')) break;
+                  out = (node.textContent || '') + out;
+                  if (node.nodeType === 1 && /^(P|DIV|TD|LI|TR|TABLE|SECTION)$/.test(node.tagName)) break;
+                  node = node.previousSibling;
+                }
+                const rawTail = out;
+                out = out.replace(/\\s+/g, ' ').trim();
+                // 只有「紧贴空位、结尾没有空白」的 1-4 个字母才算教材给的首字母提示
+                // （un____ / f____）；「in a ____」里的 a 只是普通单词
+                let hint = '';
+                const m = rawTail.match(/([A-Za-z]{1,4})$/);
+                if (m && !/\\s$/.test(rawTail)) {
+                  hint = m[1];
+                  out = out.slice(0, out.length - hint.length).trim();
+                }
+                // 空位后面的文字也要给模型：un____ la____ 这种要看到后半句才知道填什么
+                let next = scoop.nextSibling, after = '';
+                for (let guard = 0; guard < 8 && next; guard++) {
+                  if (next.nodeType === 1 && next.querySelector && next.querySelector('.fe-scoop')) break;
+                  after += (next.textContent || '');
+                  if (next.nodeType === 1 && /^(P|DIV|TD|LI|TR|TABLE|SECTION)$/.test(next.tagName)) break;
+                  next = next.nextSibling;
+                }
+                after = after.replace(/\\s+/g, ' ').trim();
+                return {leading: out, hint: hint, trailing: after.slice(0, 90)};
+            """, inp) or {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _hint_before(inp) -> str:
+        """空位前面紧挨着的首字母提示（un____ → 'un'）。"""
+        try:
+            hint = (MatchingStrategy._leading_text(inp).get('hint') or '').strip()
+        except Exception:
+            return ""
+        return hint if looks_like_given_prefix(hint) else ""
+
+    @staticmethod
+    def _segments(node) -> List[str]:
+        try:
+            return node.parent.execute_script("""
+                const node = arguments[0];
+                const out = [];
+                let buf = '';
+                const walk = (n) => {
+                  for (const child of n.childNodes) {
+                    if (child.nodeType === 3) { buf += child.textContent; continue; }
+                    if (child.nodeType !== 1) continue;
+                    if (child.classList && child.classList.contains('fe-scoop')) {
+                      out.push(buf); buf = ''; continue;
+                    }
+                    if (child.tagName === 'INPUT') { out.push(buf); buf = ''; continue; }
+                    walk(child);
+                  }
+                };
+                walk(node);
+                out.push(buf);
+                return out.map(s => (s || '').replace(/\\s+/g, ' ').trim());
+            """, node) or []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _input_index_in(node, target) -> int:
+        try:
+            return node.parent.execute_script("""
+                const node = arguments[0], target = arguments[1];
+                const inputs = [...node.querySelectorAll('input')];
+                return inputs.indexOf(target);
+            """, node, target)
+        except Exception:
+            return -1
+
+    @staticmethod
+    def _node_text_without_input(node) -> str:
+        try:
+            text = node.parent.execute_script("""
+                const node = arguments[0];
+                const clone = node.cloneNode(true);
+                for (const el of clone.querySelectorAll('input, .fe-scoop')) { el.remove(); }
+                // 脱离文档的克隆节点没有 layout，innerText 会是空串，必须用 textContent
+                return (clone.textContent || '').replace(/\\s+/g, ' ').trim();
+            """, node)
+        except Exception:
+            text = ''
+        if not text:
+            try:
+                text = re.sub(r'\s+', ' ', (node.text or '')).strip()
+            except Exception:
+                text = ''
+        return text
+
+    @staticmethod
+    def _option_letters(container) -> List[str]:
+        letters = []
+        try:
+            cells = container.find_elements(By.CSS_SELECTOR, 'td, .caption')
+        except Exception:
+            cells = []
+        for cell in cells:
+            try:
+                text = (cell.text or '').strip()
+            except Exception:
+                continue
+            if re.fullmatch(r'[A-H]', text) and text not in letters:
+                letters.append(text)
+        if letters:
+            return sorted(letters)
+        # 兜底：从 A B C D E F 这类纯字母单元格拿不到时，用题面里出现的字母
+        try:
+            body = (container.text or '')
+        except Exception:
+            body = ''
+        found = re.findall(r'\b([A-H])\b', body)
+        unique = sorted(set(found))
+        return unique if len(unique) >= 2 else []
+
+
+class ChecklistStrategy(QuestionParserStrategy):
+    """Wrapping up 自评清单（Got it 列表）。"""
+
+    def can_parse(self, container, driver) -> bool:
+        text = ""
+        try:
+            text = (container.text or '').lower()
+        except Exception:
+            return False
+        if 'got it' not in text:
+            return False
+        has_table = bool(container.find_elements(By.CSS_SELECTOR, 'table, .ant-table-tbody'))
+        has_icons = bool(container.find_elements(By.CSS_SELECTOR, '.anticon-border, [aria-label="border"]'))
+        return has_table and has_icons
+
+    def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
+        rows = []
+        try:
+            for row in container.find_elements(By.CSS_SELECTOR, 'tr.ant-table-row'):
+                if 'category-name' in (row.get_attribute('class') or ''):
+                    continue
+                try:
+                    text = row.find_element(By.CSS_SELECTOR, '.content-text').text.strip()
+                except Exception:
+                    continue
+                try:
+                    icon = row.find_element(By.CSS_SELECTOR, 'td:nth-child(2) .anticon')
+                except Exception:
+                    continue
+                if text:
+                    rows.append({'word': text, 'element': icon})
+        except Exception:
+            rows = []
+
+        if not rows:
+            return None
+
+        return Question(
+            number=question_number,
+            text=f"自我评估清单（共{len(rows)}项，全部标记 Got it）",
+            q_type=QuestionType.SELF_CHECK,
+            element=container,
+            banked_blanks=rows,
+            directions=directions,
+        )
+
+
+class GenericReplyStrategy(QuestionParserStrategy):
+    """兜底策略：任何带 textarea / 填空输入的容器都不再被整页放弃。
+
+    用于翻译、总结、搭配填空这类结构各异但本质简单的页面：
+      - textarea → TEXT（翻译方向会保留原文段落给模型）
+      - scoop 输入 → FILL_IN（带首字母提示）
+    """
+
+    def can_parse(self, container, driver) -> bool:
+        return bool(self._textareas(container)) or bool(self._scoop_inputs(container))
+
+    def parse(self, container, driver, question_number: int, directions: str = "") -> Optional[Question]:
+        textareas = self._textareas(container)
+        if textareas:
+            material = self._material_text(container, textareas[0])
+            lines = []
+            if directions:
+                lines.append(f"【题目要求】{directions}")
+            if material:
+                lines.append(f"【原文/材料】{material}")
+            if re.search(r'translat|翻译', directions or '', re.I):
+                lines.append("请把上面的原文完整翻译成中文，只输出译文。")
+            elif re.search(r'summari|总结|概括|main idea|general idea', directions or '', re.I):
+                lines.append("请根据视频/音频内容用英文写 3-4 句总结，直接输出正文。")
+            question = Question(
+                number=question_number,
+                text="\n\n".join(lines) or "请完成本页作答",
+                q_type=QuestionType.TEXT,
+                element=container,
+                inputs=textareas,
+                directions=directions,
+            )
+            return question
+
+        inputs = self._scoop_inputs(container)
+        if not inputs:
+            return None
+        blanks = []
+        for index, inp in enumerate(inputs):
+            blanks.append({
+                'index': index,
+                'context': MatchingStrategy._statement_for(inp),
+                'hint': self._hint_before(inp),
+                'input': inp,
+            })
+        return Question(
+            number=question_number,
+            text=f"填空题（共{len(inputs)}个空）",
+            q_type=QuestionType.FILL_IN,
+            element=container,
+            inputs=inputs,
+            banked_blanks=blanks,
+            directions=directions,
+        )
+
+    @staticmethod
+    def _textareas(container) -> List[Any]:
+        found = []
+        try:
+            for area in container.find_elements(By.CSS_SELECTOR, 'textarea'):
+                try:
+                    if area.is_displayed():
+                        found.append(area)
+                except Exception:
+                    continue
+        except Exception:
+            return []
+        return found
+
+    @staticmethod
+    def _scoop_inputs(container) -> List[Any]:
+        try:
+            return MatchingStrategy._sort_inputs(
+                container.find_elements(By.CSS_SELECTOR, '.fe-scoop input'))
+        except Exception:
+            return []
+
+    @staticmethod
+    def _material_text(container, textarea) -> str:
+        for selector in ('.question-inputbox-header', '.layout-material-container',
+                         '.question-common-abs-material', '.text-material-wrapper'):
+            try:
+                node = container.find_element(By.CSS_SELECTOR, selector)
+                text = (node.text or '').strip()
+                if len(text) > 20:
+                    return text
+            except Exception:
+                continue
+        try:
+            raw = (container.text or '').strip()[:2000]
+        except Exception:
+            return ""
+        # 去掉播放器控件文字，只留下真正有信息量的内容
+        noise = ['倍速', 'Words & tips', 'Words &amp; tips', '播放', '暂停']
+        lines = []
+        for line in raw.splitlines():
+            item = line.strip()
+            if not item:
+                continue
+            if re.fullmatch(r'[\d:：/\s]+', item):
+                continue
+            if any(token in item for token in noise):
+                continue
+            lines.append(item)
+        text = ' '.join(lines).strip()
+        return text if len(text) > 20 else ""
+
+    @staticmethod
+    def _hint_before(inp) -> str:
+        """抓空位前面紧挨着的首字母提示（如 un____ la____ 里的 un / la）。"""
+        return MatchingStrategy._hint_before(inp)
 
 
 class PromptBuilder:
     """Prompt构建器"""
 
-    def __init__(self, ai_client):
+    def __init__(self, ai_client, vocab_store: Optional["VocabularyStore"] = None):
         self.ai_client = ai_client
+        self.vocab_store = vocab_store
 
     def build(self, questions: List[Question], global_directions: str = "") -> str:
         lines = []
@@ -1952,6 +4324,8 @@ class PromptBuilder:
             lines.append(f"【题目指示】{effective_directions}")
             lines.append("")
 
+        lines.extend(self._vocabulary_block(questions))
+
         type_counts = {}
         for q in questions:
             type_counts[q.q_type] = type_counts.get(q.q_type, 0) + 1
@@ -1966,9 +4340,46 @@ class PromptBuilder:
             builder_method = self._get_builder_method(q.q_type)
             lines.extend(builder_method(q))
 
+        objective_types = {
+            QuestionType.SINGLE_CHOICE, QuestionType.MULTIPLE_CHOICE,
+            QuestionType.LISTENING_CHOICE, QuestionType.VIDEO_CHOICE,
+            QuestionType.TRUE_FALSE, QuestionType.SORTING,
+            QuestionType.FILL_IN, QuestionType.LISTENING_FILL_IN,
+        }
+        if any(q.q_type in objective_types for q in questions):
+            lines.append("【核对要求】作答前逐题回到材料原文核对：选择题排除与原文矛盾的选项；"
+                         "填空题逐空定位原句并抄写缺失词，不要添加修饰词，"
+                         "排序题按各选项在原文中首次出现的先后排列。")
+            lines.append("")
+
         lines.extend(self._format_instructions(type_counts))
 
         return '\n'.join(lines)
+
+    def _needs_vocabulary(self, questions: List[Question]) -> bool:
+        """题干里有中文括注、或要写口语稿时才需要把 Vocabulary 对照表塞给模型。"""
+        for q in questions:
+            if q.q_type == QuestionType.RECORD:
+                return True
+            if q.q_type in (QuestionType.FILL_IN, QuestionType.TEXT,
+                            QuestionType.BANKED_CLOZE, QuestionType.MY_VOICE_TEXT):
+                if extract_cjk_hints(q.text or '') or CJK_CHAR_PATTERN.search(q.text or ''):
+                    return True
+        return False
+
+    def _vocabulary_block(self, questions: List[Question]) -> List[str]:
+        """把 Vocabulary 页收来的中英对照塞进上下文，并要求优先复用。"""
+        if not self.vocab_store or not len(self.vocab_store):
+            return []
+        if not self._needs_vocabulary(questions):
+            return []
+        lines = ["【Vocabulary 对照表（来自本单元 Vocabulary 页，填空/口语稿的用词以它为准）】"]
+        lines.extend(self.vocab_store.prompt_lines())
+        lines.append("【要求】中文括注的空位若在下表里出现，用词必须取自表里的英文写法，不要自己意译或换同义词。")
+        lines.append("【词形】词形由你按句子语法判断——该用 -ing / -ed / 复数 / 首字母大写时就改，"
+                     "但词干必须与表里一致；改完要保证整句读起来通顺。")
+        lines.append("")
+        return lines
 
     def _vocabulary_test_hints(self) -> List[str]:
         return [
@@ -1981,8 +4392,9 @@ class PromptBuilder:
 
     def _banked_cloze_hints(self) -> List[str]:
         return [
-            "【重要提示】这是选词填空题，请从给定的单词列表中选择最合适的填入空白处。\n",
-            "【格式要求】只需返回答案本身，不要添加括号注释、不要解释、不要变形说明！"
+            "【重要提示】这是选词填空题，请从给定的单词/短语列表中选择最合适的填入空白处。\n",
+            "【格式要求】只需返回答案本身，不要添加括号注释、不要解释、不要变形说明！",
+            "【词形】若 Directions 要求 Change the form where necessary，答案必须是变形后的形式，不是词库原样。"
         ]
 
     def _get_builder_method(self, q_type: QuestionType) -> Callable[[Question], List[str]]:
@@ -2002,13 +4414,73 @@ class PromptBuilder:
             QuestionType.LISTENING_FILL_IN: self._build_listening_fill_in,
             QuestionType.LISTENING_CHOICE: self._build_listening_choice,
             QuestionType.VIDEO_CHOICE: self._build_video_choice,
+            QuestionType.MATCHING: self._build_matching,
+            QuestionType.PARAGRAPH_MATCH: self._build_paragraph_match,
+            QuestionType.LINK_MATCH: self._build_link_match,
         }
         return builders.get(q_type, self._build_unknown)
+
+    def _build_link_match(self, q: Question) -> List[str]:
+        prompts = [item for item in q.link_items if item.get('side') == 'right']
+        lines = [
+            f"{q.number}. 【连线匹配】把每个提示和它对应的选项连起来",
+            "   提示:",
+        ]
+        for index, item in enumerate(prompts):
+            label = PublishQuestionParser._link_label(item.get('text', ''), number=True)
+            lines.append(f"     {index + 1}. {label}")
+        lines.append("   选项:")
+        for opt in q.options:
+            lines.append(f"     {opt.letter}. {opt.text}")
+        lines.extend([
+            "   请判断每个提示对应哪个选项（同一选项不应重复使用），",
+            f"   只返回 {{提示序号}}.{{选项字母}}，例如 1.D 2.C 3.A 4.B（共 {len(prompts)} 组）",
+            "",
+        ])
+        return lines
+
+    def _build_matching(self, q: Question) -> List[str]:
+        letters = q.banked_options or [opt.letter for opt in q.options]
+        lines = [
+            f"{q.number}. 【匹配题】把陈述和人物字母配对",
+            "   本题的空里只需要填一个字母，不要写单词或句子。",
+            f"   可选字母: {' / '.join(letters)}",
+        ]
+        for item in q.banked_blanks:
+            lines.append(f"   空{item['index'] + 1}: {item.get('statement', '')}")
+        lines.extend([
+            "   请根据音频/视频转写判断每个人说了哪一句，",
+            f"   只返回 {{空号}}.{{字母}}，例如 1.A 2.C（共 {len(q.banked_blanks)} 个空）",
+            "   同一个字母可以在不同题里重复使用，但如果人数与陈述数相同则不要重复。",
+            "",
+        ])
+        return lines
+
+    def _build_paragraph_match(self, q: Question) -> List[str]:
+        letters = q.banked_options or list("ABCDEFGHIJKLMNO")
+        lines = [
+            f"{q.number}. 【段落信息匹配】阅读带字母的段落，判断每条陈述出自哪一段",
+            f"   可选段落字母: {' '.join(letters)}",
+            "   【阅读材料】",
+            (q.text or "")[:12000],
+            "",
+            "   【陈述】",
+        ]
+        for item in q.banked_blanks:
+            lines.append(f"   {item['index'] + 1}. {item.get('statement', '')}")
+        lines.extend([
+            "",
+            "   要求：每条陈述只填一个段落字母，不要写单词或句子；同一个段落可以被多条陈述重复选用。",
+            f"   只返回 空号.字母，例如 1.{letters[0]} 2.{letters[-1]}（共 {len(q.banked_blanks)} 个空）",
+            "",
+        ])
+        return lines
 
     def _build_sorting(self, q: Question) -> List[str]:
         lines = [
             f"{q.number}. 【排序题】{q.text}",
-            "   请根据前面提供的音频/视频转写或材料内容，将以下选项按出现顺序排序。",
+            "   请先在材料/转写中定位每个选项的原句，再按原句首次出现的先后排序。",
+            "   不要按常识、重要性或选项当前顺序排列。",
         ]
         for opt in q.options:
             lines.append(f"   {opt.letter}. {opt.text}")
@@ -2045,14 +4517,22 @@ class PromptBuilder:
             "",
             "【答题要求】",
             "1. 这是一个音频/视频理解题，请同时根据转写内容和每个空的左右上下文作答",
-            "2. 每空只填写缺失部分，不要重复空格左边或右边已经出现的词",
-            "3. 如果左边已有 be going to / I'm going to / we're 等结构，答案要能直接拼进原句并保持语法通顺",
-            "4. 不要填整句，不要串用其他空的答案",
+            "2. 答案优先照抄转写原文里的片段，取刚好能填进空的最短片段，保留原文的冠词、介词、数字和单位写法，"
+            "不要同义改写或概括",
+            "3. 每空只填写缺失部分，不要重复空格左边或右边已经出现的词",
+            "4. 如果左边已有 be going to / I'm going to / we're 等结构，答案要能直接拼进原句并保持语法通顺",
+            "5. 表格或列表题可参考行标题、列标题判断该空该填哪一类信息；同一个信息有几种说法时，"
+            "选最具体、最贴合标题的那一种",
+            "6. 答案形态要与空位一致：行标题本身已经表达的含义（如长度、宽度、时长）不要在答案里再写一遍；"
+            "同一信息有形容词和名词两种写法时，选能直接嵌进整行的那一种",
+            "7. 不要填整句，不要串用其他空的答案",
             ""
         ]
 
         for blank in q.banked_blanks:
             lines.append(f"   空{blank['index'] + 1}: {blank['sentence']}")
+            if blank.get('label'):
+                lines.append(f"      行标题: {blank['label']}")
             if blank.get('left_context') or blank.get('right_context'):
                 lines.append(f"      左侧: {blank.get('left_context', '')}")
                 lines.append(f"      右侧: {blank.get('right_context', '')}")
@@ -2082,6 +4562,19 @@ class PromptBuilder:
             f"{q.number}. 【选词填空】请从以下选项中选择最合适的{'短语' if is_phrase else '单词'}填入空白处：",
             f"   可选{'短语' if is_phrase else '单词'}: {', '.join(q.banked_options)}",
         ]
+        # 整段题面（含词库）对选词填空很关键，模型需要看全文才能确定搭配
+        material = ""
+        for line in (q.text or "").splitlines():
+            if line.startswith("【全文】"):
+                material = line[len("【全文】"):].strip()
+                break
+        if material:
+            lines.append(f"   全文: {material[:1800]}")
+        lines.append("   注意：题干里的词库一般每个词只能用一次，且必须按语法改变词形。")
+        if (q.directions or '').strip():
+            lines.append(f"   Directions: {q.directions.strip()[:400]}")
+        if is_expression_bank_question(q):
+            lines.extend(EXPRESSION_BANK_HINTS)
 
         if is_phrase:
             lines.extend([
@@ -2096,7 +4589,7 @@ class PromptBuilder:
         lines.append("")
 
         for i, blank in enumerate(q.banked_blanks, 1):
-            context = blank['context'][:250] + "..." if len(blank['context']) > 250 else blank['context']
+            context = blank['context'][:400] + "..." if len(blank['context']) > 400 else blank['context']
             context = re.sub(r'<[^>]+>', '', context)
             lines.append(f"   空{i}: {context}")
 
@@ -2138,10 +4631,52 @@ class PromptBuilder:
         lines = [f"{q.number}. 【填空】{q.text}"]
         if len(q.inputs) > 1:
             lines.append(f"   （共 {len(q.inputs)} 个空）")
+        # 静态词库 chip 不会被 BankedClozeStrategy 命中，这类题会落到这里且
+        # banked_options 为空；用 Directions 补上短语变形的约束。
+        if is_expression_bank_question(q):
+            lines.extend(EXPRESSION_BANK_HINTS)
         if q.banked_options:
             lines.append(f"   可选词: {', '.join(q.banked_options)}")
             lines.append("   （只能从可选词中选择；必要时改变词形：单复数/时态/词性/派生词）")
             lines.append("   （若空位位于句子开头，首字母必须大写，否则会扣分）")
+        hints = [b for b in q.banked_blanks if b.get('hint')]
+        contexts = [b for b in q.banked_blanks if b.get('context')]
+
+        # 题干用「中文括注」提示词义（Exercise 1 的翻译式填空），按 Vocabulary 对照表逐空对齐。
+        # 只提供对照（锚定用词），词形该不该变、怎么变由模型按句子语法判断。
+        cjk_hints = blank_cjk_hints(q)
+        vocab_hits = []
+        if cjk_hints and self.vocab_store:
+            for i, hint in enumerate(cjk_hints):
+                english = self.vocab_store.lookup(hint)
+                if english:
+                    vocab_hits.append(f"     空{i + 1}: {hint} → {english}")
+        if vocab_hits:
+            lines.append("   中文括注对应 Vocabulary 里的原词（用词以它为准）:")
+            lines.extend(vocab_hits)
+            lines.append("   （词形按句子语法自行判断：该用 -ing / -ed / 复数 / 首字母大写时就改，词干不要换词）")
+        elif cjk_hints:
+            lines.append("   中文括注提示:")
+            lines.extend(f"     空{i + 1}: {hint}" for i, hint in enumerate(cjk_hints))
+            lines.append("   （答案是从本单元 Vocabulary 学过的英文表达，请用教材里的固定搭配）")
+
+        if hints:
+            lines.append("   已给出的字母（题干已印在输入框外面，答案请给完整单词，程序会自动去掉这部分）:")
+            lines.append("   优先使用上下文里 Learning 页出现的搭配原词，不要换成同前缀的其它词。")
+            for item in hints:
+                line = f"     空{item['index'] + 1}: 已给出 {item['hint']}"
+                candidates = item.get('candidates') or []
+                if candidates:
+                    line += f"；课文里以它开头的词: {', '.join(candidates)}"
+                lines.append(line)
+        if contexts:
+            lines.append("   上下文（只给空位附近的一小段）:")
+            for item in contexts:
+                line = f"     空{item['index'] + 1}: {item['context'][:140]}"
+                right = (item.get('right_context') or '').strip()
+                if right:
+                    line += f"  ___  {right[:80]}"
+                lines.append(line)
         lines.append("")
         return lines
 
@@ -2149,7 +4684,10 @@ class PromptBuilder:
         lines = [f"{q.number}. 【简答题】{q.text}"]
         if len(q.inputs) > 1:
             lines.append(f"   （共 {len(q.inputs)} 小题）")
-        lines.append("   （请提供简洁准确的回答，如果不是翻译题，那么只用英文回答）")
+        if re.search(r'translat|翻译', q.directions or '', re.I) or '翻译成中文' in (q.text or ''):
+            lines.append("   （翻译题：把原文完整翻译成中文，只输出译文，不要保留英文原文）")
+        else:
+            lines.append("   （请提供简洁准确的回答，如果不是翻译题，那么只用英文回答）")
         lines.append("")
         return lines
 
@@ -2161,6 +4699,30 @@ class PromptBuilder:
             "",
         ]
         return lines
+
+    def build_speaking_script(self, q: Question, directions: str = "",
+                              target_seconds: float = 90.0) -> str:
+        """没有原声的录音题（主观题）用：让模型写一段可以直接朗读的英文口语稿。"""
+        target_seconds = float(target_seconds or 90.0)
+        words_low = max(60, int(target_seconds * 2.1))
+        words_high = max(words_low + 20, int(target_seconds * 2.6))
+
+        lines = [
+            "【口语录音题】页面上只有一个计时录音按钮，没有参考答案，需要你自己说一段英文。",
+            f"【题目要求】{(q.text or '').strip()[:900]}",
+        ]
+        if directions and directions.strip() and directions.strip() not in (q.text or ''):
+            lines.append(f"【题目指示】{directions.strip()[:400]}")
+        if self.vocab_store and len(self.vocab_store):
+            lines.append("【本单元 Vocabulary（尽量自然地用上这些表达，不要硬塞）】")
+            lines.extend(self.vocab_store.prompt_lines(24))
+        lines.extend([
+            "【输出要求】",
+            "1. 只输出可以直接朗读的英文正文；不要标题、不要 markdown、不要括号说明、不要中文。",
+            f"2. 长度约 {words_low}-{words_high} 词，句子短、口语化，适合朗读。",
+            "3. 紧扣题目要求组织内容，并结合相关材料给出具体回答。",
+        ])
+        return "\n".join(lines)
 
     def _build_unknown(self, q: Question) -> List[str]:
         lines = [f"{q.number}. 【题】{q.text}"]
@@ -2196,10 +4758,13 @@ class PromptBuilder:
             lines.append("判断依据：题目明确标注'多选'或有多个正确选项时选多个，否则单选")
 
         if QuestionType.BANKED_CLOZE in type_counts or QuestionType.DROPDOWN_SELECT in type_counts:
-            lines.append("选词/选择填空: 1.word1 2.word2 ...")
+            lines.append("选词/选择填空: 1.答案1 2.答案2 ...（答案可以是多词短语）")
 
         if QuestionType.FILL_IN in type_counts:
-            lines.append("填空题: 1.答案1 2.答案2 ...")
+            lines.append("填空题: 每空一行，按空号编号：\n1. 答案1\n2. 答案2 ...（可多词，保留小数）")
+
+        if QuestionType.LISTENING_FILL_IN in type_counts:
+            lines.append("听力/视频填空题: 每空一行，按空号编号：\n1. 答案1\n2. 答案2 ...（照抄转写原文，保留小数）")
 
         if QuestionType.TRUE_FALSE in type_counts:
             lines.append("判断题: 每题回答 T 或 F，如：1.T 2.F")
@@ -2211,7 +4776,16 @@ class PromptBuilder:
             lines.append("My voice文字作答: 1.英文介绍内容（500字符以内）")
 
         if QuestionType.SORTING in type_counts:
-            lines.append("排序题: 直接返回排序后的字母，如：B E A D C F")
+            lines.append("排序题: 按题号返回排序后的字母，如：1.B E A D C F")
+
+        if QuestionType.MATCHING in type_counts:
+            lines.append("匹配题: 每空一个字母，格式：1.B 2.A 3.F（不要写单词）")
+
+        if QuestionType.PARAGRAPH_MATCH in type_counts:
+            lines.append("段落信息匹配: 1.H 2.N ...（只填段落字母，同一段可重复）")
+
+        if QuestionType.LINK_MATCH in type_counts:
+            lines.append("连线匹配: 提示序号配选项字母，格式：1.D 2.C 3.A 4.B（不要写选项原文）")
 
         lines.append("-" * 50)
         return lines
@@ -2221,7 +4795,10 @@ class PromptBuilder:
         # 题面和空号都在 q.text 里，此时退回填空式提示词，否则模型看不到题目。
         if not q.banked_blanks:
             lines = [f"{q.number}. 【选择填空】{q.text}"]
-            total = q.answer_count or len(re.findall(r'\(\d+\)', q.text)) or 1
+            # Cloze 页编号是 1) 2) 而不是 (1) (2)，两种都要数得出来
+            total = (q.answer_count
+                     or len(re.findall(r'\(\d+\)|\b\d{1,2}\)', q.text))
+                     or 1)
             lines.append(f"   （共 {total} 个空，按空号 1..{total} 顺序作答）")
             if q.banked_options:
                 lines.append(f"   可选选项: {', '.join(q.banked_options)}")
@@ -2235,9 +4812,15 @@ class PromptBuilder:
             f"   可选选项: {', '.join(q.banked_options)}",
             ""
         ]
+        # Cloze 是一整篇文章，只给空位附近一小段会让模型看不到上下文与编号。
+        for line in (q.text or "").splitlines():
+            if line.startswith("【全文】"):
+                lines.append(f"   全文: {line[len('【全文】'):].strip()[:6000]}")
+                break
+        lines.append("")
 
         for i, blank in enumerate(q.banked_blanks, 1):
-            context = blank['context'][:200] + "..." if len(blank['context']) > 200 else blank['context']
+            context = blank['context'][:400] + "..." if len(blank['context']) > 400 else blank['context']
             context = re.sub(r'<[^>]+>', '', context)
             lines.append(f"   空{i}: {context}")
 
@@ -2253,8 +4836,10 @@ class AnswerExecutor:
     ANSWER_LABEL_PATTERN = r'(?:My voice文字作答|简答题|选词/选择填空|填空题|答案|选词填空|翻译|Answer)'
     NUMBER_PREFIX_PATTERN = r'(?:空\s*)?\d+\s*[.、:：\)\]]|Blank\s*\d+\s*[.、:：\)\]]'
 
-    def __init__(self, driver):
+    def __init__(self, driver, tts: Optional["TTSEngine"] = None, stop_requested=None):
         self.driver = driver
+        self.tts = tts
+        self.stop_requested = stop_requested if stop_requested is not None else threading.Event()
 
     def execute(self, question: Question, answer: str) -> bool:
         executors = {
@@ -2270,6 +4855,10 @@ class AnswerExecutor:
             QuestionType.TEXT: self._fill_text,
             QuestionType.MY_VOICE_TEXT: self._fill_text,
             QuestionType.LISTENING_FILL_IN: self._fill_listening_fill_in,
+            QuestionType.MATCHING: self._fill_matching,
+            QuestionType.PARAGRAPH_MATCH: self._fill_paragraph_match,
+            QuestionType.RECORD: self._answer_record,
+            QuestionType.ORAL_ALOUD: self._answer_oral_aloud,
         }
 
         executor = executors.get(question.q_type, self._fill_unknown)
@@ -2278,6 +4867,10 @@ class AnswerExecutor:
     def _fill_single_choice(self, q: Question, answer: str) -> bool:
         valid_letters = [opt.letter or chr(65 + idx) for idx, opt in enumerate(q.options)]
         letters = self._parse_choice_letters(answer, valid_letters)
+        if not letters:
+            letters = self._letters_from_option_text(answer, q)
+            if letters:
+                print(f"\t答案不是字母，已按选项原文反查: {letters}")
         if len(letters) != 1:
             print(f"\t单选题需要一个有效选项，收到: {answer}")
             return False
@@ -2305,6 +4898,10 @@ class AnswerExecutor:
     def _fill_multiple_choice(self, q: Question, answer: str) -> bool:
         letters = self._parse_choice_letters(answer, [opt.letter for opt in q.options])
         if not letters:
+            letters = self._letters_from_option_text(answer, q)
+            if letters:
+                print(f"\t答案不是字母，已按选项原文反查: {letters}")
+        if not letters:
             print(f"\t多选题答案没有有效的选项组合: {answer}")
             return False
         for opt in q.options:
@@ -2321,6 +4918,9 @@ class AnswerExecutor:
             return False
 
         print(f"\t排序答案: {' '.join(order)}")
+        if self._apply_sorting_by_react(q, order):
+            return True
+
         if self._apply_sorting_by_drag(q, order):
             return True
 
@@ -2335,6 +4935,9 @@ class AnswerExecutor:
         if not valid:
             return []
 
+        single_answer = re.fullmatch(r'\s*\d+\s*[.、:：)\]]\s*([A-Z][A-Z\s,，、;；>→-]*)\s*', answer.upper())
+        if single_answer:
+            answer = single_answer.group(1)
         numbered = re.findall(r'\d+\s*[.、)\]]\s*([A-Z])\b', answer.upper())
         candidates = numbered if numbered else re.findall(r'\b([A-Z])\b', answer.upper())
 
@@ -2376,6 +4979,53 @@ class AnswerExecutor:
 
     def _current_sorting_order(self, q: Question) -> List[str]:
         return [item['letter'] for item in self._get_sorting_items(q)]
+
+    def _apply_sorting_by_react(self, q: Question, order: List[str]) -> bool:
+        js = """
+        const root = arguments[0];
+        const order = arguments[1];
+        const wrapper = root.classList.contains('sortable-list-wrapper')
+            ? root
+            : root.querySelector('.sortable-list-wrapper');
+        if (!wrapper) return false;
+        const fiberKey = Object.keys(wrapper).find(k => k.startsWith('__reactFiber$'));
+        if (!fiberKey) return false;
+
+        let fiber = wrapper[fiberKey];
+        let sortable = null;
+        let component = null;
+        for (let depth = 0; depth < 12 && fiber; depth++, fiber = fiber.return) {
+            const props = fiber.memoizedProps;
+            const state = fiber.memoizedState;
+            if (!sortable && props && typeof props.onSortEnd === 'function') sortable = fiber;
+            if (!component && state && Array.isArray(state.options)) component = fiber;
+            if (sortable && component) break;
+        }
+        if (!sortable || !component) return false;
+
+        const currentOptions = () => (
+            (component.stateNode && component.stateNode.state && component.stateNode.state.options)
+            || component.memoizedState.options
+            || []
+        );
+        let options = currentOptions();
+        if (!order.every(letter => options.some(opt => opt.value === letter))) return false;
+
+        for (let i = 0; i < order.length; i++) {
+            options = currentOptions();
+            const from = options.findIndex(opt => opt.value === order[i]);
+            if (from >= 0 && from !== i) sortable.memoizedProps.onSortEnd({oldIndex: from, newIndex: i});
+        }
+        return true;
+        """
+        try:
+            if not self.driver.execute_script(js, q.element, order):
+                return False
+            time.sleep(0.4)
+            return self._current_sorting_order(q) == order
+        except Exception as e:
+            print(f"\tReact 排序失败: {str(e)[:60]}")
+            return False
 
     def _apply_sorting_by_drag(self, q: Question, order: List[str]) -> bool:
         try:
@@ -2472,7 +5122,10 @@ class AnswerExecutor:
             if blank['input'] and word:
                 try:
                     clean_word = word.strip()
-                    matched = self._match_to_option(clean_word, q.banked_options, is_phrase_mode)
+                    clean_word = self._strip_given_prefix(blank.get('hint', ''), clean_word)
+                    matched = self._match_to_option(
+                        clean_word, q.banked_options, is_phrase_mode,
+                        allow_rewrite=not is_expression_bank_question(q))
                     if matched:
                         clean_word = matched
                         print(f"        匹配到选项: {clean_word}")
@@ -2483,15 +5136,12 @@ class AnswerExecutor:
                     )
                     time.sleep(0.3)
 
-                    blank['input'].clear()
-                    time.sleep(0.1)
-                    blank['input'].send_keys(clean_word)
-
-                    self.driver.execute_script("""
-                        arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
-                        arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-                        arguments[0].dispatchEvent(new Event('blur', {bubbles: true}));
-                    """, blank['input'])
+                    # 与 _fill_fill_in 走同一套写入：真实键盘输入 + 回读校验，
+                    # 失败时用 React native setter 兜底。原来只 send_keys 再派发
+                    # Event('input') 且不回读，输入没生效也会算成功并自动交卷。
+                    if not self._fill_text_input_verified(blank['input'], clean_word):
+                        print(f"        空{i + 1}: 写入后校验失败，跳过该空")
+                        continue
 
                     print(f"        空{i + 1}: {clean_word}")
                     success_count += 1
@@ -2501,9 +5151,10 @@ class AnswerExecutor:
                     print(f"      填空 {i + 1} 失败:{error_msg[:50]} ")
                     logger.error(f"详细错误: {error_msg}", exc_info=True)
 
-        return success_count > 0
+        return bool(q.banked_blanks) and success_count == len(q.banked_blanks)
 
-    def _match_to_option(self, answer: str, options: List[str], is_phrase_mode: bool) -> Optional[str]:
+    def _match_to_option(self, answer: str, options: List[str], is_phrase_mode: bool,
+                         allow_rewrite: bool = True) -> Optional[str]:
         if not answer or not options:
             return None
 
@@ -2511,7 +5162,9 @@ class AnswerExecutor:
 
         for opt in options:
             if opt.lower() == answer_lower:
-                return opt
+                # 短语变形题要保留模型给出的词形与大小写：词库里是小写的原形，
+                # 直接返回 opt 会把 "At the heart of" 降回 "at the heart of"。
+                return answer if not allow_rewrite else opt
 
         if is_phrase_mode:
             for opt in options:
@@ -2523,7 +5176,11 @@ class AnswerExecutor:
                             return answer
                     continue
 
+                # 短语变形题里词库是原形、正确答案是变形形式；把部分匹配吸附回
+                # 词库原文会直接把对的改错（equipped with -> be equipped with）。
                 if answer_lower in opt_lower and len(answer_lower) >= 4:
+                    if not allow_rewrite:
+                        continue
                     return opt
                 if opt_lower in answer_lower:
                     return answer
@@ -2562,6 +5219,14 @@ class AnswerExecutor:
         for i, inp in enumerate(q.inputs):
             ans = answers[i] if i < len(answers) else ""
             if ans:
+                # 题目把首字母/前缀印在输入框外面（un____），输入框里只该填剩下的部分
+                hint = ""
+                if i < len(q.banked_blanks):
+                    hint = q.banked_blanks[i].get('hint') or ''
+                stripped = self._strip_given_prefix(hint, ans)
+                if stripped != ans:
+                    print(f"\t空{i + 1}: 去掉已给出的「{hint}」-> {stripped}")
+                    ans = stripped
                 print(f"\t空{i + 1}: {ans}")
                 if self._fill_text_input_verified(inp, ans):
                     success_count += 1
@@ -2570,7 +5235,24 @@ class AnswerExecutor:
             else:
                 print(f"\t空{i + 1}: (空)")
 
-        return success_count > 0
+        if q.inputs and success_count < len(q.inputs):
+            print(f"\t只填写 {success_count}/{len(q.inputs)} 个空，不提交")
+        return bool(q.inputs) and success_count == len(q.inputs)
+
+    @staticmethod
+    def _strip_given_prefix(hint: str, answer: str) -> str:
+        """答案里已经包含题干给出的前缀时，只把剩余部分写进输入框。
+
+        例：题干 `un____`，模型答 `unhappy` → 输入框里写 `happy`；
+            题干 `per____`，模型答 `personal` → 写 `sonal`。
+        """
+        text = (answer or "").strip()
+        prefix = (hint or "").strip()
+        if not text or not prefix:
+            return text
+        if len(text) > len(prefix) and text[:len(prefix)].lower() == prefix.lower():
+            return text[len(prefix):].lstrip()
+        return text
 
     @classmethod
     def _extract_answer_by_number(cls, answer: str, question_number: int) -> str:
@@ -2619,6 +5301,684 @@ class AnswerExecutor:
     def _number_prefix_pattern(number: int) -> str:
         return rf'(?:(?:空\s*)?{number}\s*[.、:：\)\]]|Blank\s*{number}\s*[.、:：\)\]])'
 
+    # ===== 跟读/朗读录音题 =====
+    # 录音器（chivox）在开始拉流后的前 ~0.6 秒会丢块并补静音，参考音频前面垫
+    # 这么多静音才能让整句落进有效窗口（实测 0.8s：逐词 100/100/100，总分 95）。
+    RECORD_LEAD_PAD = 0.8
+    RECORD_RETRY_PAD = 1.3
+    RECORD_MIN_SCORE = 60
+    RECORD_MAX_SECONDS = 105.0  # 限时自由作答（页面写的 02:00）留一点余量
+    RECORD_AUDIO_CACHE: Dict[str, bytes] = {}
+
+    def _answer_record(self, q: Question, answer: str = "") -> bool:
+        """完成录音题：有原声用原声，没原声用 TTS 朗读页面原文。"""
+        items = list(q.record_items or [])
+        if not items:
+            print("\t没有找到录音条目")
+            return False
+        if items[0].get('role_play'):
+            return self._answer_role_play(q)
+        if items[0].get('vocab'):
+            return self._answer_vocabulary_read_aloud(q)
+
+        self._dismiss_record_popup()
+        probe = self.driver.execute_async_script(RECORD_MIC_JS, "", self.RECORD_LEAD_PAD, 0)
+        if not probe or not probe.get("ok"):
+            print(f"\t录音注入初始化失败: {probe}")
+            return False
+
+        texts = self._record_speech_texts(q, answer)
+        if not any((item.get('url') or '').strip() for item in items):
+            print("\t录音题没有原声，用 TTS 朗读页面原文")
+
+        for idx in range(len(items)):
+            try:
+                self._record_one_item(q, idx, texts)
+            except Exception as exc:
+                print(f"\t第 {idx + 1} 条录音失败: {str(exc)[:80]}")
+                logger.error("录音题执行失败", exc_info=True)
+
+        # 收尾：平台提交时会检查「有没有作答」，漏掉的条目补录一次
+        missing = [i for i in range(len(items)) if not self._row_done(q, i)]
+        if missing:
+            print(f"\t有 {len(missing)} 条没有录制结果，补录: {[i + 1 for i in missing]}")
+            for idx in missing:
+                try:
+                    self._record_one_item(q, idx, texts)
+                except Exception:
+                    logger.error("录音题补录失败", exc_info=True)
+
+        done = sum(1 for i in range(len(items)) if self._row_done(q, i))
+        print(f"\t录音题完成 {done}/{len(items)} 条")
+        return done == len(items)
+
+    ORAL_ALOUD_COUNTDOWN = 130
+    ORAL_ALOUD_TIMEOUT = 420
+
+    def _answer_oral_aloud(self, q: Question, answer: str = "") -> bool:
+        """段落朗读题：准备阶段就注入 TTS 音频，强制录音一次录完。"""
+        if self.stop_requested.is_set():
+            return False
+        item = (q.record_items or [{}])[0]
+        text = (item.get('text') or '').strip() or self._record_reading_text(q)
+        if not text:
+            print("\t朗读题没有读到原文，跳过")
+            return False
+        if not self._tts().enabled:
+            print("\t朗读题需要 TTS，TTS 已关闭，跳过")
+            return False
+        state = self.driver.execute_script(ORAL_ALOUD_STATE_JS) or {}
+        if (state.get('score') or '').strip():
+            print(f"\t朗读题已有得分 {state.get('score')}，跳过")
+            return True
+        data = self._speech_audio(text, self.RECORD_MAX_SECONDS)
+        if not data:
+            return False
+        payload = base64.b64encode(data).decode('ascii')
+        probe = self.driver.execute_async_script(
+            RECORD_MIC_JS, payload, self.RECORD_LEAD_PAD, self.RECORD_MAX_SECONDS)
+        if not probe or not probe.get('ok'):
+            print(f"\t朗读音频注入失败: {probe}")
+            return False
+        self._oral_stop_after = float(probe.get('dur') or 0) + 1.0
+        print("\t朗读题：开始强制流程（约 4 分钟）")
+        if not self._oral_aloud_start(q):
+            return False
+        score = self._wait_oral_aloud(q)
+        if score is None:
+            print("\t朗读题等待超时，没有拿到分数")
+            return False
+        print(f"\t朗读题得分 {score}")
+        return True
+
+    def _oral_aloud_start(self, q: Question) -> bool:
+        """点 start 进入强制流程；已经在倒计时或录音中就直接用。"""
+        state = self.driver.execute_script(ORAL_ALOUD_STATE_JS) or {}
+        label = (state.get('btn') or '').strip()
+        if state.get('recording') or (label and label != 'start'):
+            return True
+        try:
+            button = q.element.find_element(By.CSS_SELECTOR, '.p-oral-aloud-button .button-start')
+        except Exception:
+            try:
+                button = self.driver.find_element(
+                    By.CSS_SELECTOR, '.p-oral-aloud-button .button-start')
+            except Exception:
+                print("\t找不到朗读题的 start 按钮")
+                return False
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'})", button)
+            time.sleep(0.3)
+            button.click()
+        except Exception as exc:
+            print(f"\t点击 start 失败: {str(exc)[:60]}")
+            return False
+        return True
+
+    def _wait_oral_aloud(self, q: Question) -> Optional[float]:
+        """等强制录音结束出分：倒计时 → 强制录音 → 主动停止 → 出分。"""
+        start = time.time()
+        active_start = None
+        stopped = False
+        while time.time() - start < self.ORAL_ALOUD_TIMEOUT:
+            if self.stop_requested.is_set():
+                return None
+            try:
+                state = self.driver.execute_script(ORAL_ALOUD_STATE_JS) or {}
+            except Exception:
+                state = {}
+            raw = (state.get('score') or '').strip()
+            if raw:
+                try:
+                    return float(raw)
+                except ValueError:
+                    return 0.0
+            label = (state.get('timer') or state.get('btn') or '').strip()
+            match = re.search(r'(\d{1,2}):(\d{2})', label)
+            active = bool(match and (int(match.group(1)) > 0 or int(match.group(2)) > 0))
+            if active:
+                if active_start is None:
+                    active_start = time.time()
+                stop_after = getattr(self, '_oral_stop_after', 0.0)
+                if not stopped and stop_after and time.time() - active_start >= stop_after:
+                    stopped = True
+                    try:
+                        btn = q.element.find_element(By.CSS_SELECTOR, '.record-icon.button-record')
+                        self.driver.execute_script('arguments[0].click()', btn)
+                        print("\t朗读录音结束，点击停止")
+                    except Exception:
+                        try:
+                            btn = self.driver.find_element(By.CSS_SELECTOR, '.record-icon.button-record')
+                            self.driver.execute_script('arguments[0].click()', btn)
+                            print("\t朗读录音结束，点击停止")
+                        except Exception:
+                            pass
+            time.sleep(2)
+        return None
+
+    def _answer_vocabulary_read_aloud(self, q: Question) -> bool:
+        """词汇跟读页：逐张卡片用页面原声冒充麦克风，不调用 AI。
+
+        swiper 只渲染 active slide，所以每轮重新抓一次卡片信息，录完调
+        slideNext()，等待下一张真实内容挂载；整组上传完成后才返回成功。
+        """
+        if self.stop_requested.is_set():
+            return False
+        first = (q.record_items or [{}])[0]
+        total = int(first.get('vocab_total') or 0) or 0
+        if total <= 0:
+            print("\t未读到词汇卡片总数，停止以免遗漏卡片")
+            return False
+        print(f"\t词汇跟读：共 {total} 张卡片，使用页面原声逐张跟读（不调用 AI）")
+
+        self._dismiss_record_popup()
+        probe = self.driver.execute_async_script(
+            RECORD_MIC_JS, "", self.RECORD_LEAD_PAD, 0)
+        if not probe or not probe.get("ok"):
+            print(f"\t录音注入初始化失败: {probe}")
+            return False
+
+        # 快速处理可能从中间卡片开始；先回第一张，确保前面的卡片也会处理。
+        try:
+            current = self.driver.execute_script(VOCAB_CARD_JS, q.element) or {}
+            if int(current.get('index') or 0) != 1:
+                if not self.driver.execute_script(VOCAB_NEXT_JS, q.element, True):
+                    print("\t无法返回第一张词汇卡片，停止")
+                    return False
+        except Exception:
+            return False
+
+        done = 0
+        for index in range(1, total + 1):
+            info = self._wait_vocab_card(q, index)
+            if not info:
+                print(f"\t第 {index} 张卡片尚未就绪，停止")
+                break
+            word = (info.get('word') or '').strip()
+            ok = self._record_vocab_card(q, info)
+            print(f"\t词汇跟读 [{index}/{total}] {word} -> {'OK' if ok else '失败'}")
+            if not ok or self.stop_requested.is_set():
+                break
+            done += 1
+            if index == total:
+                break
+
+            try:
+                moved = self.driver.execute_script(VOCAB_NEXT_JS, q.element)
+            except Exception:
+                moved = ''
+            if not moved:
+                print("\t找不到下一张卡片的切换方式，停止")
+                break
+
+        print(f"\t词汇跟读完成 {done}/{total} 张")
+        return done == total and not self.stop_requested.is_set()
+
+    def _wait_vocab_card(self, q: Question, index: int) -> Optional[Dict]:
+        """进度和卡片内容都就绪后才开始录音，避免对懒加载占位作答。"""
+        for _ in range(24):
+            if self.stop_requested.is_set():
+                return None
+            try:
+                info = self.driver.execute_script(VOCAB_CARD_JS, q.element) or {}
+                if (int(info.get('index') or 0) == index
+                        and (info.get('word') or '').strip() and info.get('hasButton')
+                        and self._vocab_record_buttons(q)):
+                    return info
+            except Exception:
+                pass
+            if self.stop_requested.wait(0.25):
+                return None
+        return None
+
+    def _vocab_record_buttons(self, q: Question) -> List[Any]:
+        try:
+            slide = q.element.find_element(By.CSS_SELECTOR, '.swiper-slide-active')
+            return find_record_buttons(self.driver, slide)
+        except Exception:
+            return []
+
+    def _wait_vocab_upload(self, q: Question, baseline: Dict,
+                           timeout: float = 30.0) -> bool:
+        """只接受当前卡片本次上传的新地址，原声、blob 和历史回放均不算完成。"""
+        previous = set(baseline.get('recordings') or [])
+        for _ in range(max(1, int(timeout * 4))):
+            if self.stop_requested.is_set():
+                return False
+            try:
+                info = self.driver.execute_script(VOCAB_CARD_JS, q.element) or {}
+                if info and (info.get('index') != baseline.get('index')
+                             or info.get('word') != baseline.get('word')):
+                    return False
+                uploaded = any(src.startswith(('http://', 'https://')) and src not in previous
+                               for src in info.get('recordings') or [])
+                if uploaded and not info.get('recording'):
+                    return True
+            except Exception:
+                pass
+            if self.stop_requested.wait(0.25):
+                return False
+        return False
+
+    def _record_vocab_card(self, q: Question, info: Dict) -> bool:
+        """单张卡片：下载页面原声（无原声时 TTS 读该词）→ 注入 → 点录音/停止。
+
+        录制前保存历史回放地址，停止后等本次上传产生新地址再翻卡。
+        """
+        if self.stop_requested.is_set():
+            return False
+        word = (info.get('word') or '').strip()
+        raw = info.get('audio') or ''
+        url = raw.split('#')[0].strip()
+        duration = float(info.get('duration') or 0) or 1.2
+        data = (self._download_record_audio(url) if url
+                else self._speech_audio(word, 0))
+        if not data:
+            print(f"\t{word}: {'原声下载失败' if url else 'TTS 生成失败'}")
+            return False
+
+        payload = base64.b64encode(data).decode()
+        state = self.driver.execute_async_script(
+            RECORD_MIC_JS, payload, self.RECORD_LEAD_PAD, 0)
+        if not state or not state.get('ok'):
+            print(f"\t{word}: 音频注入失败 {state}")
+            return False
+        clip = float(state.get('dur') or 0) or (duration + self.RECORD_LEAD_PAD)
+
+        try:
+            baseline = self.driver.execute_script(VOCAB_CARD_JS, q.element) or {}
+        except Exception:
+            return False
+        if baseline.get('index') != info.get('index') or baseline.get('word') != word:
+            return False
+        buttons = self._vocab_record_buttons(q)
+        if not buttons:
+            print(f"\t{word}: 没找到录音按钮")
+            return False
+        button = buttons[0]
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", button)
+        except Exception:
+            pass
+        if self.stop_requested.wait(0.2):
+            return False
+        if not WebDriverHelper.safe_click(self.driver, button):
+            print(f"\t{word}: 点击录音失败")
+            return False
+        interrupted = self.stop_requested.wait(clip + 0.8)
+        # React 可能替换按钮；停止时重新定位。取消任务也须结束正在进行的录音。
+        buttons = self._vocab_record_buttons(q)
+        if not buttons or not WebDriverHelper.safe_click(self.driver, buttons[0]):
+            print(f"\t{word}: 点击停止失败")
+            return False
+        if interrupted or self.stop_requested.is_set():
+            return False
+        if not self._wait_vocab_upload(q, baseline):
+            print(f"\t{word}: 未确认本次录音上传完成")
+            return False
+        return True
+
+    def _record_row(self, item: Dict):
+        row_index = (item or {}).get('row_index')
+        if not isinstance(row_index, int) or row_index < 0:
+            return None
+        try:
+            rows = self.driver.find_elements(By.CSS_SELECTOR, '.oral-study-sentence')
+            if not rows:
+                rows = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    '.question-video-dub-pc .question-common-abs-reply > .item')
+        except Exception:
+            return None
+        if row_index >= len(rows):
+            return None
+        return rows[row_index]
+
+    def _record_button(self, q: Question, idx: int = 0):
+        items = q.record_items or []
+        buttons = find_record_buttons(self.driver, q.element)
+        if len(buttons) == len(items) and idx < len(buttons):
+            return buttons[idx]
+        row = self._record_row(items[idx] if idx < len(items) else {})
+        if row is not None:
+            row_buttons = find_record_buttons(self.driver, row)
+            if row_buttons:
+                return row_buttons[0]
+        return buttons[idx] if idx < len(buttons) else None
+
+    def _row_state(self, q: Question, idx: int) -> Optional[dict]:
+        try:
+            return self.driver.execute_script(
+                RECORD_ROW_STATE_JS, q.element, idx, list(record_button_selectors()))
+        except Exception:
+            # 页面重渲染会让旧 element 失效，换到这一行再读一次
+            items = q.record_items or []
+            row = self._record_row(items[idx]) if idx < len(items) else None
+            if row is None:
+                return None
+            try:
+                return self.driver.execute_script(
+                    RECORD_ROW_STATE_JS, row, 0, list(record_button_selectors()))
+            except Exception:
+                return None
+
+    @staticmethod
+    def _row_recorded(state: dict, baseline: Optional[dict] = None) -> bool:
+        """这一条是否已经有结果。
+
+        跟读题看分数（`.score_layout`）；自由作答虽然没有参考答案，但平台上传音频后
+        同样会给一个分数，同时页面里会出现可回放的 <audio src="http://...mp3">。
+        """
+        if not state:
+            return False
+        if state.get('score') is not None:
+            return True
+        if state.get('recorded'):
+            return True
+        if baseline:
+            return (state.get('blob') or 0) > (baseline.get('blob') or 0) or \
+                   (state.get('uploaded') or 0) > (baseline.get('uploaded') or 0)
+        return False
+
+    def _row_done(self, q: Question, idx: int) -> bool:
+        return self._row_recorded(self._row_state(q, idx) or {})
+
+    def _record_reading_text(self, q: Question) -> str:
+        """页面上写好的朗读原文：优先各条目的句子，其次题干里的英文行。"""
+        parts = [(item.get('text') or '').strip() for item in (q.record_items or [])]
+        joined = ' '.join(part for part in parts if part).strip()
+        if joined:
+            return joined[:600]
+        lines = [(line or '').strip() for line in (q.text or '').splitlines()]
+        english = [line for line in lines
+                   if re.search(r'[A-Za-z]{3}', line)
+                   and not CJK_CHAR_PATTERN.search(line)]
+        return ' '.join(english)[:600]
+
+    def _record_speech_texts(self, q: Question, answer: str) -> List[str]:
+        """每条要朗读的文本：条目自己的原文优先，其次模型稿件，最后题干英文。"""
+        count = len(q.record_items or [])
+        if count <= 0:
+            return []
+        text = (answer or '').strip() or self._record_reading_text(q)
+        texts = self._split_speech(text, count) if text and count > 1 else [text] * count
+        return [(item.get('text') or '').strip() or texts[idx]
+                for idx, item in enumerate(q.record_items)]
+
+    @staticmethod
+    def _split_speech(text: str, count: int) -> List[str]:
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text or '') if s.strip()]
+        if len(sentences) <= 1:
+            return [text] + [''] * (count - 1)
+        size = max(1, -(-len(sentences) // count))
+        chunks = [' '.join(sentences[i:i + size]) for i in range(0, len(sentences), size)]
+        chunks = [chunk for chunk in chunks if chunk]
+        while len(chunks) < count:
+            chunks.append('')
+        return chunks[:count]
+
+    def _tts(self) -> TTSEngine:
+        if getattr(self, 'tts', None) is None:
+            self.tts = TTSEngine()
+        return self.tts
+
+    def _speech_audio(self, text: str, idx: int) -> Optional[bytes]:
+        text = (text or '').strip()
+        if not text:
+            print(f"\t第 {idx + 1} 条: 没有可朗读的稿件")
+            return None
+        engine = self._tts()
+        fmt, data = engine.synthesize(text, self.RECORD_MAX_SECONDS)
+        if not data:
+            print(f"\t第 {idx + 1} 条: TTS 合成失败（{engine.last_error or '未知原因'}）")
+            return None
+        print(f"\t第 {idx + 1} 条: TTS 生成 {fmt} 音频 {len(data)} 字节")
+        return data
+
+    def _record_one_item(self, q: Question, idx: int, texts: Optional[List[str]] = None) -> bool:
+        items = q.record_items or []
+        if idx >= len(items):
+            return False
+        item = items[idx]
+        url = (item.get('url') or '').strip()
+        max_dur = 0.0
+        if url:
+            data = self._download_record_audio(url)
+            if not data:
+                print(f"\t第 {idx + 1} 条: 参考音频下载失败")
+                return False
+        else:
+            text = texts[idx] if texts and idx < len(texts) else ''
+            data = self._speech_audio(text, idx)
+            if not data:
+                return False
+            max_dur = self.RECORD_MAX_SECONDS
+
+        payload = base64.b64encode(data).decode()
+        baseline = self._row_state(q, idx) or {}
+        last_state = None
+        # 有原声的跟读题失败时可以换更大的静音垫重试；主观题一段要录几十秒，
+        # 重录代价太大，只录一次
+        pads = (self.RECORD_LEAD_PAD, self.RECORD_RETRY_PAD) if url else (self.RECORD_LEAD_PAD,)
+        for pad in pads:
+            state = self.driver.execute_async_script(RECORD_MIC_JS, payload, pad, max_dur)
+            if not state or not state.get("ok"):
+                print(f"\t第 {idx + 1} 条: 音频注入失败 {state}")
+                return False
+            clip = float(state.get("dur") or 0) or (float(item.get('duration') or 0) + pad)
+
+            button = self._record_button(q, idx)
+            if button is None:
+                print(f"\t第 {idx + 1} 条: 录音按钮已消失")
+                return False
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", button)
+            time.sleep(0.3)
+            if not WebDriverHelper.safe_click(self.driver, button):
+                print(f"\t第 {idx + 1} 条: 点击录音失败")
+                return False
+            time.sleep(clip + 1.0)
+            stop_button = self._record_button(q, idx)
+            if stop_button is None or not WebDriverHelper.safe_click(
+                    self.driver, stop_button):
+                print(f"\t第 {idx + 1} 条: 点击停止失败")
+
+            # 停止后平台要上传音频再评分，长录音要多等一会儿
+            timeout = max(30.0, min(120.0, clip * 1.2))
+            last_state = self._wait_record_finish(q, idx, timeout=timeout, baseline=baseline)
+            score = (last_state or {}).get('score')
+            if score is None:
+                if last_state and self._row_recorded(last_state, baseline):
+                    print(f"\t第 {idx + 1} 条: 已录制（{clip:.1f}s，未返回分数）")
+                    return True
+                print(f"\t第 {idx + 1} 条: 未拿到录制结果（可能录音未被识别）")
+            else:
+                print(f"\t第 {idx + 1} 条: 得分 {score}")
+                if int(score) >= self.RECORD_MIN_SCORE:
+                    return True
+            time.sleep(0.6)
+            if last_state is None:
+                break
+        return bool(last_state) and self._row_recorded(last_state, baseline)
+
+    def _wait_record_score(self, q: Question, idx: int, timeout: float = 20.0) -> Optional[int]:
+        """轮询页面，等第 idx 条录音的分数出现（只看这条自己那一行）。"""
+        state = self._wait_record_finish(q, idx, timeout=timeout)
+        return state.get('score') if state else None
+
+    def _wait_record_finish(self, q: Question, idx: int, timeout: float = 25.0,
+                            baseline: Optional[dict] = None) -> Optional[dict]:
+        """等这一条录音出结果；若发现还停在录音状态，补一次停止点击。"""
+        deadline = time.time() + timeout
+        extra_stops = 0
+        while time.time() < deadline:
+            # 重渲染后旧元素会失效，按行号重新定位。
+            state = self._row_state(q, idx)
+            if state and (state.get('score') is not None
+                          or self._row_recorded(state, baseline)):
+                return state
+            if state and state.get('stop') and extra_stops < 2:
+                # 还在录：说明停止那一下没点中，补点一次
+                extra_stops += 1
+                try:
+                    button = self._record_button(q, idx)
+                    if button is not None:
+                        WebDriverHelper.safe_click(self.driver, button)
+                        print(f"\t第 {idx + 1} 条: 检测到仍在录音，补一次停止点击")
+                except Exception:
+                    pass
+                time.sleep(1.5)
+                continue
+            time.sleep(0.5)
+        return None
+
+    def _answer_role_play(self, q: Question) -> bool:
+        self._dismiss_record_popup()
+        roles = [e for e in q.element.find_elements(By.CSS_SELECTOR, '.role-list label.label')
+                 if e.is_displayed()]
+        if roles and not WebDriverHelper.safe_click(self.driver, roles[0]):
+            return False
+        try:
+            WebDriverWait(self.driver, 10).until(
+                lambda d: any(e.is_displayed() for e in q.element.find_elements(
+                    By.CSS_SELECTOR, '.role-reply .record-seat')))
+            info = self.driver.execute_script("""
+                const row = arguments[0].querySelector('.role-reply .list-item-review');
+                if (!row) return null;
+                let fiber = row[Object.keys(row).find(k => k.startsWith('__reactFiber'))];
+                while (fiber && !(fiber.memoizedProps || {}).question) fiber = fiber.return;
+                const question = fiber && fiber.memoizedProps.question;
+                const selected = arguments[0].querySelector('.role-reply .score:not(.hide)');
+                const role = selected && selected.closest('.list-item-review').querySelector('.role');
+                if (!question || !role) return null;
+                const children = question.children || [];
+                return {lines: children.filter(x => x.role && x.role.name === role.textContent.trim())
+                    .map(x => ({url: (x.contents || []).find(c => c.type === 1 && c.path)?.path || ''})),
+                    seconds: children.reduce((s, x) => s + ((x.config || {}).recordTime || 0) / 1000, 0)};
+            """, q.element)
+            if not info or not info.get('lines'):
+                print('\t无法读取角色台词')
+                return False
+            clips = []
+            for line in info['lines']:
+                data = self._download_record_audio((line.get('url') or '').split('#')[0])
+                if not data:
+                    print('\t角色台词缺少参考音频')
+                    return False
+                clips.append(base64.b64encode(data).decode())
+            prepared = self.driver.execute_async_script("""
+                const done = arguments[arguments.length - 1], api = window.__ucRec;
+                if (!api) { done(false); return; }
+                (async () => {
+                    const queue = [];
+                    for (const b64 of arguments[0]) {
+                        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+                        queue.push(await api.ctxOf().decodeAudioData(bytes.buffer));
+                    }
+                    api.rolePlayStream = api.stream;
+                    api.rolePlayQueue = queue;
+                    api.stream = function () {
+                        api.buf = api.rolePlayQueue.shift() || null;
+                        return api.rolePlayStream();
+                    };
+                    done(true);
+                })().catch(() => done(false));
+            """, clips)
+            if not prepared:
+                print('\t角色台词音频初始化失败')
+                return False
+            started = False
+            try:
+                seat = q.element.find_element(By.CSS_SELECTOR, '.role-reply .record-seat')
+                if not WebDriverHelper.safe_click(self.driver, seat):
+                    return False
+                started = True
+                deadline = time.time() + max(90, min(600, info.get('seconds', 0) * 2 + 60))
+                while time.time() < deadline and not self.stop_requested.is_set():
+                    state = self.driver.execute_script("""
+                        const root = arguments[0], api = window.__ucRec;
+                        const rows = [...root.querySelectorAll('.role-play-quiz .list-item-review')];
+                        const scores = [...root.querySelectorAll('.role-play-quiz .score:not(.hide)')];
+                        const audio = root.querySelector('.role-reply audio');
+                        return {left: api.rolePlayQueue.length,
+                            scores: scores.map(x => x.textContent.trim()),
+                            finished: rows.length && rows[rows.length - 1].classList.contains('active') &&
+                                (!audio || audio.paused || audio.ended)};
+                    """, q.element)
+                    if (state['left'] == 0 and len(state['scores']) == len(clips)
+                            and all(state['scores']) and state['finished']):
+                        print(f"\t角色扮演录音完成，得分: {', '.join(state['scores'])}")
+                        started = False
+                        return True
+                    self.stop_requested.wait(0.5)
+                print('\t角色扮演录音未完成')
+                return False
+            finally:
+                if started:
+                    buttons = q.element.find_elements(By.CSS_SELECTOR, '.role-reply .pre-page-btn')
+                    if buttons:
+                        WebDriverHelper.safe_click(self.driver, buttons[0])
+                self.driver.execute_script("""
+                    const api = window.__ucRec;
+                    if (api && api.rolePlayStream) {
+                        api.stream = api.rolePlayStream;
+                        delete api.rolePlayStream;
+                        delete api.rolePlayQueue;
+                        api.buf = null;
+                    }
+                """)
+        except Exception as exc:
+            print(f'\t角色扮演处理失败: {str(exc)[:100]}')
+            return False
+
+    def _download_record_audio(self, url: str) -> Optional[bytes]:
+        if not url:
+            return None
+        url = url.strip()
+        # 页面里的音频常写成协议相对地址（//host/path）或站内绝对路径
+        if url.startswith('//'):
+            url = 'https:' + url
+        elif url.startswith('/'):
+            url = 'https://ucontent.unipus.cn' + url
+        cached = self.RECORD_AUDIO_CACHE.get(url)
+        if cached:
+            return cached
+        try:
+            request = urllib.request.Request(url, headers={
+                'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                               'AppleWebKit/537.36 (KHTML, like Gecko) '
+                               'Chrome/120.0 Safari/537.36'),
+                'Referer': 'https://ucontent.unipus.cn/',
+            })
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = response.read()
+            if data:
+                if len(self.RECORD_AUDIO_CACHE) >= 64:
+                    self.RECORD_AUDIO_CACHE.clear()
+                self.RECORD_AUDIO_CACHE[url] = data
+                return data
+        except Exception as exc:
+            print(f"\t参考音频下载失败: {str(exc)[:80]}")
+        return None
+
+    def _dismiss_record_popup(self):
+        try:
+            self.driver.execute_script("""
+                const selectors = ['.system-info-cloud-ok-button',
+                                   '.know-box .iKnow',
+                                   '.ant-modal-close',
+                                   '.ant-modal-confirm-btns .ant-btn-primary'];
+                for (const sel of selectors) {
+                    const btn = document.querySelector(sel);
+                    if (btn) { btn.click(); }
+                }
+            """)
+            time.sleep(0.4)
+        except Exception:
+            pass
+
     def _fill_text(self, q: Question, answer: str) -> bool:
         if not q.inputs:
             return False
@@ -2627,12 +5987,14 @@ class AnswerExecutor:
 
         if expected_count == 1:
             ans = self._extract_answer_by_number(answer, q.number)
+            if not ans and q.q_type == QuestionType.TEXT:
+                # 翻译/总结这类整段作答：模型常常直接给一整段，不能按题号切分而丢内容
+                direct = self._clean_direct_text_answer(answer)
+                if len(direct) > len(ans):
+                    ans = direct
             if not ans:
-                if q.q_type == QuestionType.MY_VOICE_TEXT:
-                    ans = self._clean_direct_text_answer(answer)
-                else:
-                    answers = self._parse_banked_answer(answer, expected_count)
-                    ans = answers[0] if answers else ""
+                answers = self._parse_banked_answer(answer, expected_count)
+                ans = answers[0] if answers else ""
         else:
             answers = self._parse_banked_answer(answer, expected_count)
             success_count = 0
@@ -2681,7 +6043,7 @@ class AnswerExecutor:
         if self._input_value_matches(inp, ans):
             return True
 
-        print("\t常规输入未生效，尝试JS同步输入框状态")
+        print("\t输入框为受控组件，使用 JS 同步值")
         self.driver.execute_script("""
             const el = arguments[0];
             const value = arguments[1];
@@ -2825,6 +6187,95 @@ class AnswerExecutor:
             return clipped[:sentence_end + 1]
         return clipped
 
+    def _fill_matching(self, q: Question, answer: str) -> bool:
+        """匹配题：每个空只写一个字母（A-F）。"""
+        total = len(q.inputs) or len(q.banked_blanks)
+        letters_pool = [opt.letter.upper() for opt in q.options] or list("ABCDEF")
+        letters = self._parse_matching_letters(answer, total, letters_pool)
+        if not letters:
+            print(f"\t匹配题没有解析出字母: {answer[:80]}")
+            return False
+
+        print(f"\t匹配答案: {letters}")
+        success = 0
+        for idx, inp in enumerate(q.inputs):
+            letter = letters[idx] if idx < len(letters) else ""
+            if not letter:
+                continue
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", inp)
+                time.sleep(0.1)
+            except Exception:
+                pass
+            if self._fill_text_input_verified(inp, letter):
+                success += 1
+            else:
+                print(f"\t空{idx + 1}: 写入 {letter} 失败")
+        return success == total or (success > 0 and success == len(q.inputs))
+
+    def _fill_paragraph_match(self, q: Question, answer: str) -> bool:
+        """段落信息匹配：每个输入框只写一个段落字母。"""
+        total = len(q.inputs) or len(q.banked_blanks)
+        pool = [str(x).upper() for x in (q.banked_options or [])] or list("ABCDEFGHIJKLMNO")
+        letters = self._parse_paragraph_letters(answer, total, pool)
+        if not any(letters):
+            print(f"\t段落匹配没有解析出字母: {answer[:80]}")
+            return False
+        print(f"\t段落匹配答案: {letters}")
+        success = 0
+        for idx, inp in enumerate(q.inputs):
+            letter = letters[idx] if idx < len(letters) else ""
+            if not letter:
+                continue
+            try:
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", inp)
+                time.sleep(0.1)
+            except Exception:
+                pass
+            if self._fill_text_input_verified(inp, letter):
+                success += 1
+            else:
+                print(f"\t空{idx + 1}: 写入 {letter} 失败")
+        return success == total
+
+    @staticmethod
+    def _parse_paragraph_letters(answer: str, total: int, pool: List[str]) -> List[str]:
+        """解析 1.H 2.N 形式的答案；字母池由段落数决定，支持 A-Z 与重复使用。"""
+        text = (answer or "").upper()
+        valid = set(pool)
+        found = {}
+        for num, letter in re.findall(
+                r'(?:^|[\s,;，；])(\d{1,2})\s*[.、:：)）=\-]?\s*([A-Z])(?![A-Z])', text):
+            idx = int(num) - 1
+            if 0 <= idx < total and letter in valid:
+                found.setdefault(idx, letter)
+        if found:
+            return [found.get(i, "") for i in range(total)]
+        seq = [c for c in re.findall(r'(?<![A-Z])([A-Z])(?![A-Z])', text)
+               if c in valid]
+        return (seq + [""] * total)[:total]
+
+    @staticmethod
+    def _parse_matching_letters(answer: str, total: int, pool: List[str]) -> List[str]:
+        """把模型输出解析成按空号排序的字母列表。"""
+        text = (answer or "").upper()
+        valid = set(pool) if pool else set("ABCDEFGH")
+
+        numbered = {}
+        for num, letter in re.findall(r'(?:^|[\s,;，；])(\d{1,2})\s*[.、:：)）=\-]?\s*([A-H])(?![A-Z])', text):
+            idx = int(num) - 1
+            if 0 <= idx < total and letter in valid:
+                numbered.setdefault(idx, letter)
+        if numbered:
+            return [numbered.get(i, "") for i in range(total)]
+
+        seq = [ch for ch in re.findall(r'[A-H]', text) if ch in valid]
+        # 去掉题目里常见的 A-F 说明文字造成的重复
+        if len(seq) >= total:
+            seq = seq[:total]
+        return seq or []
+
     def _fill_unknown(self, q: Question, answer: str) -> bool:
         return False
 
@@ -2876,10 +6327,32 @@ class AnswerExecutor:
             except:
                 continue
 
+        # 老播放器底部「提 交」是个 div.btn（不是 button），上面的选择器容易漏掉；
+        # 这里按可见文本兜底点一次，否则整页做完也不会交卷。
+        try:
+            fallback = self.driver.execute_script("""
+                const clean = t => (t || '').replace(/\\s+/g, '');
+                const cands = [...document.querySelectorAll('button, a, div, span')];
+                for (const el of cands) {
+                  if (!el.getClientRects().length) continue;
+                  const text = clean(el.innerText);
+                  if (text !== '提交' && text !== '交卷' && text !== '确认提交') continue;
+                  if (el.querySelector('button, a, div')) continue;
+                  return el;
+                }
+                return null;
+            """)
+            if fallback is not None:
+                print("\t通过文本兜底点击提交按钮")
+                return WebDriverHelper.safe_click(self.driver, fallback)
+        except Exception:
+            pass
+
         return False
 
     @classmethod
     def _parse_choice_letters(cls, answer: str, valid_letters: List[str]) -> List[str]:
+        answer = re.sub(r'^\s*(?:单选题|多选题)\s*[：:]\s*', '', answer)
         answer = cls._clean_extracted_answer(answer).rstrip('.。').upper()
         if not re.fullmatch(r'[A-Z][A-Z\s,，、/;&+]*', answer):
             return []
@@ -2888,10 +6361,62 @@ class AnswerExecutor:
         return letters if set(letters) <= valid else []
 
     @staticmethod
+    def _letters_from_option_text(answer: str, question: Question) -> List[str]:
+        """模型把选项原文写回来时，反查对应的选项字母（修复「该填字母却填单词」）。"""
+        text = (answer or '').strip()
+        if not text:
+            return []
+        lowered = text.lower()
+        hits = []
+        for opt in question.options:
+            body = (opt.text or '').strip().lower()
+            if len(body) < 6:
+                continue
+            body = re.sub(r'\s+', ' ', body)
+            if body and body[:40] in re.sub(r'\s+', ' ', lowered):
+                hits.append(opt.letter.upper())
+        return list(dict.fromkeys(hits))
+
+    @staticmethod
+    def _split_numbered_answers(answer: str, expected_count: int) -> List[str]:
+        """按编号从左往右顺序切分答案，避免把 3.5% 的 3. 当成新编号。"""
+        text = re.sub(
+            rf'^{AnswerExecutor.ANSWER_LABEL_PATTERN}\s*[：:]\s*', '', answer.strip(), flags=re.I
+        )
+        token_re = re.compile(
+            r'(?<![\d.])(?:(?:空|Blank)\s*)?(\d{1,2})\s*(?:\.(?!\d)|\.(?=\d+\.\d)|[、:：\)\]])', re.I
+        )
+        tokens = [(int(m.group(1)), m.start(), m.end()) for m in token_re.finditer(text)]
+        if not tokens:
+            return []
+
+        chosen = {}
+        cursor = 0
+        for number in range(1, expected_count + 1):
+            candidates = [t for t in tokens if t[0] == number and t[1] >= cursor]
+            if not candidates:
+                return []
+            chosen[number] = candidates[0]
+            cursor = candidates[0][2]
+
+        result = []
+        for number in range(1, expected_count + 1):
+            start = chosen[number][2]
+            end = chosen[number + 1][1] if number < expected_count else len(text)
+            value = re.sub(r'[\s,，;；]+$', '', text[start:end].strip())
+            if not value:
+                return []
+            result.append(value)
+        return result
+
+    @staticmethod
     def _parse_banked_answer(answer: str, expected_count: int) -> List[str]:
         result = [''] * expected_count
         answer = AnswerExecutor._normalize_answer_labels(answer)
         answer = re.sub(rf'^{AnswerExecutor.ANSWER_LABEL_PATTERN}\s*[：:]\s*', '', answer.strip(), flags=re.I)
+        numbered = AnswerExecutor._split_numbered_answers(answer, expected_count)
+        if numbered:
+            return numbered
         print(f"    [调试] 清理后答案前200字: {answer[:200]}...")
 
         matched_any = False
@@ -2954,7 +6479,13 @@ class AnswerExecutor:
                 )
                 time.sleep(0.5)
 
-                trigger = select_wrapper.find_element(By.CSS_SELECTOR, '.ant-dropdown-trigger')
+                try:
+                    trigger = select_wrapper.find_element(
+                        By.CSS_SELECTOR,
+                        '.ant-dropdown-trigger, .ant-select-selector, [role="combobox"]')
+                except NoSuchElementException:
+                    # 通用探测拿到的 blank['element'] 本身就是触发器
+                    trigger = select_wrapper
 
                 actions = ActionChains(self.driver)
                 actions.move_to_element(trigger).click().perform()
@@ -2968,7 +6499,8 @@ class AnswerExecutor:
                             EC.presence_of_element_located((
                                 By.CSS_SELECTOR,
                                 '.ant-dropdown:not(.ant-dropdown-hidden) .ant-dropdown-menu, '
-                                '.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item'
+                                '.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item, '
+                                '[role="listbox"], [class*="dropdown"] li'
                             ))
                         )
                         if dropdown_menu.is_displayed():
@@ -3007,6 +6539,25 @@ class AnswerExecutor:
                             break
                     except Exception as e:
                         continue
+
+                if not option_clicked:
+                    # 自绘下拉的候选项不一定带 ant-* class，按 role / 类名关键字再找一轮
+                    try:
+                        for opt in self.driver.find_elements(
+                                By.CSS_SELECTOR,
+                                '[role="option"], .ant-select-item-option, '
+                                '.ant-dropdown-menu-item, li[class*="option"]'):
+                            if not opt.is_displayed():
+                                continue
+                            label = (opt.text or '').strip()
+                            if label and (label.lower() == ans.lower()
+                                          or ans.lower() in label.lower()):
+                                ActionChains(self.driver).move_to_element(opt).click().perform()
+                                print(f"         通用候选项点击: {label[:20]}")
+                                option_clicked = True
+                                break
+                    except Exception:
+                        pass
 
                 if not option_clicked:
                     for xpath in option_selectors[3:]:
@@ -3138,7 +6689,8 @@ class AnswerExecutor:
             var wrapper = arguments[0];
             var value = arguments[1];
 
-            var trigger = wrapper.querySelector('.ant-dropdown-trigger');
+            var trigger = wrapper.querySelector('.ant-dropdown-trigger, .ant-select-selector, [role="combobox"]') || wrapper;
+            if (!trigger) return false;
             var events = ['mousedown', 'focus', 'click', 'input', 'change', 'blur'];
 
             events.forEach(function(eventType) {
@@ -3373,6 +6925,51 @@ class PublishTaskScope:
     block_only: bool = False
 
     @classmethod
+    def capture_visible(cls, driver):
+        """快速处理只取视口中的题块；iframe 初始锚点不随手动滚动更新。"""
+        state = driver.execute_script("""
+            const selector = '[data-lexical-node-type="question-block"]';
+            const blocks = [...document.querySelectorAll(selector + ', [data-ipublish-question-group-type]')]
+                .filter(el => el.matches(selector) || !el.closest(selector));
+            const candidates = blocks.map(el => {
+                const r = el.getBoundingClientRect();
+                let top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
+                let left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
+                for (let p = el.parentElement; p; p = p.parentElement) {
+                    const style = getComputedStyle(p), box = p.getBoundingClientRect();
+                    if (/auto|scroll|hidden|clip/.test(style.overflowY)) {
+                        top = Math.max(top, box.top); bottom = Math.min(bottom, box.bottom);
+                    }
+                    if (/auto|scroll|hidden|clip/.test(style.overflowX)) {
+                        left = Math.max(left, box.left); right = Math.min(right, box.right);
+                    }
+                }
+                let anchor = el.dataset.lexicalNodeAnchor || el.id || '';
+                if (!anchor) {
+                    const inner = el.querySelector(
+                        '[data-ipublish-question-group-type][id], [data-question-id][id]');
+                    if (inner) anchor = inner.id || inner.dataset.lexicalNodeAnchor || '';
+                }
+                const visible = el.getClientRects().length && right > left && bottom > top;
+                return {el, anchor, height: visible ? bottom - top : 0};
+            }).filter(item => item.anchor && item.height > 0)
+              .sort((a, b) => b.height - a.height);
+            if (!candidates.length) return {error: '当前视口没有题目，请先滚动到需要处理的题块'};
+            const {el, anchor} = candidates[0];
+            const root = el.closest('.editor-content') || document.body;
+            const headings = [...root.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter(head =>
+                !head.closest('[data-ipublish-question-group-type]') &&
+                (head.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
+            const heading = headings[headings.length - 1];
+            return {document_url: location.href.split('#')[0], start_anchor: anchor,
+                    title: heading ? (heading.innerText || heading.textContent || '').trim() : '当前题块',
+                    block_only: true};
+        """)
+        if not state or state.get('error'):
+            raise ValueError((state or {}).get('error', '无法定位当前可见题块'))
+        return cls(**state)
+
+    @classmethod
     def capture(cls, driver, anchor: str = ''):
         """调用前进入内容层。无法确认任务边界时抛错，禁止退回整单元作答。"""
         state = driver.execute_script("""
@@ -3443,6 +7040,7 @@ class PublishQuestionParser:
         'single_choice_group': 'choice',
         'multiple_choice_group': 'choice',
         'multi_choice_group': 'choice',
+        'evaluation_group': 'choice',
         'true_false_group': 'true_false',
         'fill_blanks_group': 'fill',
         'fill_blanks_choice_group': 'fill',
@@ -3451,15 +7049,20 @@ class PublishQuestionParser:
         'translation_group': 'text',
         'writing_group': 'text',
         'multi_media_upload_group': 'upload',
+        'ai_oral_practice_group': 'ai_oral',
         'rich_text_read_group': 'skip',
         'discussion_group': 'skip',
-        'text_match_group': 'skip',
-        'oral_personal_state_group': 'skip',
+        'text_match_group': 'link_match',
+        'oral_personal_state_group': 'record',
+        'oral_sentence_scoop_group': 'record',
+        'vocabulary_group': 'record',
+        'sequence_group': 'sorting',
     }
 
     QUESTION_TYPE_KINDS = {
         'single_choice': 'choice',
         'multiple_choice': 'choice',
+        'evaluation': 'choice',
         'true_false': 'true_false',
         'fill_blanks': 'fill',
         'fill_blanks_choice': 'fill',
@@ -3467,6 +7070,8 @@ class PublishQuestionParser:
         'short_answer': 'text',
         'translation': 'text',
         'writing': 'text',
+        'oral_personal_state': 'record',
+        'oral_sentence_scoop': 'record',
     }
     CHOICE_HEADER_SKIP = 'strongListView'
     EXPLANATION_PLACEHOLDERS = ('请输入',)
@@ -3571,6 +7176,11 @@ class PublishQuestionParser:
             contents = []
         parts = []
         for content in contents:
+            try:
+                if content.find_elements(By.XPATH, 'ancestor::*[contains(@class, "q-answer-and-analysis")]'):
+                    continue
+            except Exception:
+                pass
             if skip_class:
                 try:
                     ancestor = content.find_elements(
@@ -3728,6 +7338,12 @@ class PublishQuestionParser:
             return self._parse_fill_blanks(group, start_number, dropdown=True)
         if kind == 'text':
             return self._parse_text(group, start_number)
+        if kind == 'link_match':
+            return self._parse_link_match(group, start_number)
+        if kind == 'record':
+            return self._parse_record(group, start_number, group_type)
+        if kind == 'sorting':
+            return self._parse_sequence(group, start_number)
         if kind != 'skip':
             self.unsupported.append(group_type)
         return []
@@ -3752,11 +7368,53 @@ class PublishQuestionParser:
         return passages
 
     # ---- 各题型 ---------------------------------------------------------
+    def _prompt_fallback(self, group) -> str:
+        """题干不在题组内时，取题组前最近的一段正文（优先同卡片的段落）。"""
+        try:
+            text = self.driver.execute_script("""
+                const group = arguments[0];
+                const id = group.id || group.dataset.lexicalNodeAnchor || '';
+                const prefix = id.split('==')[0];
+                const card = [...document.querySelectorAll('.editor-question-block')]
+                    .find(b => ((b.dataset.lexicalNodeAnchor || b.id || '')
+                        .startsWith(prefix)));
+                const scope = card || group;
+                const pick = (el) => {
+                    const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    return t.length >= 12 && t.length < 400 ? t : '';
+                };
+                // 先看卡片前后的兄弟节点
+                let sib = scope.previousElementSibling;
+                for (let i = 0; i < 4 && sib; i++) {
+                    const t = pick(sib);
+                    if (t) return t;
+                    sib = sib.previousElementSibling;
+                }
+                // 再看所属编辑器里、卡片之前最近的段落
+                const root = scope.closest('.editor-content') || document.body;
+                const before = (el) =>
+                    !!(el.compareDocumentPosition(scope) & Node.DOCUMENT_POSITION_FOLLOWING);
+                const paras = [...root.querySelectorAll('p')]
+                    .filter(el => before(el) && !el.contains(scope) &&
+                        !el.closest('[data-ipublish-question-group-type]'));
+                for (let i = paras.length - 1; i >= 0; i--) {
+                    const t = pick(paras[i]);
+                    if (t) return t;
+                }
+                return '';
+            """, group)
+            return self.clean_text(text or '', limit=None)
+        except Exception:
+            return ''
+
     def _parse_choices(self, group, group_type: str, start_number: int) -> List[Question]:
         questions = []
         multiple = 'multiple' in group_type or 'multi_choice' in group_type
-        for node in self._question_nodes(group):
+        nodes = self._question_nodes(group)
+        for node in nodes:
             text = self._stem_text(node, skip_class=self.CHOICE_HEADER_SKIP)
+            if not text and len(nodes) == 1:
+                text = self.group_direction(group) or self._prompt_fallback(group)
             options = self._choice_options(node)
             if not text or not options:
                 continue
@@ -3770,8 +7428,61 @@ class PublishQuestionParser:
             ))
         return questions
 
+    def _parse_record(self, group, start_number: int, group_type: str = '') -> List[Question]:
+        questions = []
+        nodes = self._question_nodes(group)
+        for node in nodes:
+            buttons = node.find_elements(
+                By.CSS_SELECTOR,
+                '[class*="i-record_record-wave-wrapper"], [class*="result_re-record-wrapper"], '
+                '[class*="i-oral-reply_oral-base-re-record-wrapper"]')
+            text = self._stem_text(node)
+            if group_type == 'vocabulary_group':
+                words = node.find_elements(By.CSS_SELECTOR, '[class*="q-oral-vocabulary-content_word-text"]')
+                text = self.element_text(words[0]) if words else ''
+            if not text and len(nodes) == 1:
+                text = self.group_direction(group)
+            if not buttons or not text:
+                continue
+            samples = node.find_elements(By.CSS_SELECTOR, '[class*="answer_sample-audio-wrapper"] audio')
+            if group_type == 'vocabulary_group':
+                samples = node.find_elements(By.CSS_SELECTOR, '[class*="q-oral-vocabulary-content_media"] audio')
+            url = samples[0].get_attribute('src') if samples else ''
+            questions.append(Question(
+                number=start_number + len(questions), text=text,
+                q_type=QuestionType.RECORD, element=node, group=group,
+                record_items=[{'url': url or '', 'element': buttons[0],
+                               'text': '' if group_type == 'oral_sentence_scoop_group' and not url else text,
+                               'sample': samples[0] if samples else None}],
+            ))
+        return questions
+
+    def _parse_sequence(self, group, start_number: int) -> List[Question]:
+        questions = []
+        for node in self._question_nodes(group):
+            rows = node.find_elements(By.CSS_SELECTOR, '[data-optionid][data-index]')
+            if not rows:
+                continue
+            questions.append(Question(number=start_number + len(questions),
+                text=self.group_direction(group), q_type=QuestionType.SORTING,
+                element=node, group=group, options=[Option(letter=chr(65 + index),
+                    text=self._stem_text(row), element=row) for index, row in enumerate(rows)]))
+        return questions
+
     def _choice_options(self, node) -> List[Option]:
         options = []
+        if self._question_type(node) == 'evaluation':
+            radios = node.find_elements(By.CSS_SELECTOR, '[role="radio"][aria-posinset]')
+            labels = node.find_elements(By.CSS_SELECTOR, '[class*="q-rates_title__"]')
+            for index, radio in enumerate(radios):
+                value = radio.get_attribute('aria-posinset')
+                if len(labels) == 2 and index in (0, len(radios) - 1):
+                    value += f' ({self.element_text(labels[0 if index == 0 else 1])})'
+                options.append(Option(
+                    letter=chr(65 + index), text=value, element=radio,
+                    is_selected=radio.get_attribute('aria-checked') == 'true',
+                ))
+            return options
         try:
             rows = node.find_elements(By.CSS_SELECTOR, '[class*="strongListView"]')
         except Exception:
@@ -3872,6 +7583,80 @@ class PublishQuestionParser:
         """填空/下拉题：把每个空位替换成 (N) 标记，保证 AI 能对上空号。"""
         return self._dom_text(node, numbered=True, limit=None)
 
+    # ---- 连线匹配 -------------------------------------------------------
+    LINK_NODE_WAIT_SECONDS = 12.0
+
+    LINK_NODES_JS = """
+    const group = arguments[0];
+    const nodes = [...group.querySelectorAll('.react-flow__node')];
+    return nodes.map((node, index) => {
+      const handle = node.querySelector('.react-flow__handle');
+      return {
+        i: index,
+        id: node.getAttribute('data-id') || '',
+        side: handle ? (handle.getAttribute('data-handlepos') || '') : '',
+        text: (node.innerText || '').replace(/\\s+/g, ' ').trim(),
+      };
+    });
+    """
+
+    def _link_nodes(self, group) -> List[Dict[str, Any]]:
+        """读取画布节点。
+
+        连线题是 React Flow 画布：左列提示节点的连接点在自己的**右**侧
+        （data-handlepos=right），右列选项节点的连接点在**左**侧（left）。
+        节点文字跟正文一样是懒渲染的，没等齐就取会拿到空串，AI 只能瞎配，
+        所以这里等到全部有字再返回。
+        """
+        deadline = time.time() + self.LINK_NODE_WAIT_SECONDS
+        nodes: List[Dict[str, Any]] = []
+        while True:
+            try:
+                raw = self.driver.execute_script(self.LINK_NODES_JS, group)
+            except Exception:
+                raw = None
+            nodes = [item for item in (raw or []) if isinstance(item, dict)]
+            if nodes and all((item.get('text') or '').strip() for item in nodes):
+                return nodes
+            if time.time() >= deadline:
+                return nodes
+            time.sleep(0.8)
+
+    def _parse_link_match(self, group, start_number: int) -> List[Question]:
+        """连线匹配：一个题目组 = 一张画布，作为单题交给 AI 配对。"""
+        nodes = self._link_nodes(group)
+        prompts = [item for item in nodes if item.get('side') == 'right']
+        options = [item for item in nodes if item.get('side') == 'left']
+        if not prompts or not options:
+            self.unsupported.append('text_match_group')
+            return []
+        prompt_lines = [f"{index + 1}. {self._link_label(item.get('text', ''), number=True)}"
+                        for index, item in enumerate(prompts)]
+        return [Question(
+            number=start_number,
+            text='\n'.join(prompt_lines),
+            q_type=QuestionType.LINK_MATCH,
+            element=group,
+            options=[Option(letter=chr(65 + index),
+                            text=self._link_label(item.get('text', ''), number=False),
+                            element=None)
+                     for index, item in enumerate(options)],
+            group=group,
+            directions=self.group_direction(group),
+            link_items=nodes,
+        )]
+
+    @staticmethod
+    def _link_label(text: str, number: bool = True) -> str:
+        """去掉节点自带的「1.」「A.」前缀，避免和我们的编号重复。
+
+        画布节点文字本身就带序号（提示是 `1. Paras. 1-2`，选项是 `A. The role …`），
+        直接拼会变成「1. 1. Paras. 1-2」。只在前缀后跟空白时才剥，避免误伤
+        「5G」「A-level」这类正文。
+        """
+        pattern = r'^\s*\d{1,2}\s*[.、:：)）]\s+' if number else r'^\s*[A-Za-z]\s*[.、:：)）]\s+'
+        return re.sub(pattern, '', text or '').strip()
+
     def _parse_text(self, group, start_number: int) -> List[Question]:
         questions = []
         for node in self._question_nodes(group):
@@ -3951,6 +7736,154 @@ class PublishAnswerExecutor(AnswerExecutor):
     RULE_POPUP_TEXTS = ('我知道了', '知道了', '确定')
     last_rejection = ''  # 最近一次提交被平台拒绝时的提示文案
 
+    def __init__(self, driver, tts=None, stop_requested=None):
+        super().__init__(driver, tts=tts, stop_requested=stop_requested)
+
+    def _fill_single_choice(self, q: Question, answer: str) -> bool:
+        if q.options and q.element.find_elements(By.CSS_SELECTOR, '[data-ipublish-question-type="evaluation"]'):
+            letters = self._parse_choice_letters(answer, [opt.letter for opt in q.options])
+            if len(letters) != 1:
+                return False
+            index = next(i for i, opt in enumerate(q.options) if opt.letter == letters[0])
+            selected = [opt.element.get_attribute('aria-checked') == 'true' for opt in q.options]
+            if selected[index] and (index == len(selected) - 1 or not selected[index + 1]):
+                return True
+            if not WebDriverHelper.safe_click(self.driver, q.options[index].element):
+                return False
+            selected = [opt.element.get_attribute('aria-checked') == 'true' for opt in q.options]
+            return selected[index] and (index == len(selected) - 1 or not selected[index + 1])
+        return super()._fill_single_choice(q, answer)
+
+    def play_material(self, media, timeout: float = 20.0) -> bool:
+        """实际播放材料至少三秒；短音频须播放到结束。"""
+        try:
+            start = self.driver.execute_script("""
+                const media = arguments[0];
+                media.currentTime = 0;
+                const start = media.currentTime || 0;
+                media.muted = true;
+                const playing = media.play();
+                if (playing && playing.catch) playing.catch(() => {});
+                return start;
+            """, media)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not self.stop_requested.is_set():
+                state = self.driver.execute_script("""
+                    const media = arguments[0];
+                    return {time: media.currentTime || 0, ended: media.ended,
+                            error: !!media.error};
+                """, media) or {}
+                elapsed = float(state.get('time') or 0) - float(start or 0)
+                if elapsed >= 3 or (state.get('ended') and elapsed > 0):
+                    return True
+                if state.get('error') or self.stop_requested.wait(0.25):
+                    break
+        except Exception as exc:
+            print(f"    材料播放失败: {str(exc)[:80]}")
+        finally:
+            try:
+                self.driver.execute_script('arguments[0].pause();', media)
+            except Exception:
+                pass
+        return False
+
+    def _answer_record(self, q: Question, answer: str = "") -> bool:
+        """新版口语题按准备时间、真实录音和上传状态逐题处理。"""
+        item = q.record_items[0]
+        url = (item.get('url') or '').strip()
+        if url and item.get('sample') and not self.play_material(item['sample']):
+            print("\t样音播放失败")
+            return False
+        if url:
+            data = self._download_record_audio(url)
+        else:
+            text = (item.get('text') or '').strip() or answer or self._record_reading_text(q)
+            data = self._speech_audio(text, 0)
+        if not data or self.stop_requested.is_set():
+            return False
+        started = False
+        try:
+            prep = self.driver.execute_script(r"""
+                const boxes = arguments[0].querySelectorAll('[class*="i-record-count-down_title-wrapper"]');
+                for (const box of boxes) {
+                    const text = (box.innerText || '').replace(/\s/g, '');
+                    const match = text.match(/准备时长(\d{2}):(\d{2})/);
+                    if (match) return Number(match[1]) * 60 + Number(match[2]);
+                }
+                return 3;
+            """, q.element)
+            prep = max(0.0, min(float(prep), 30.0))
+            state = self.driver.execute_async_script(
+                RECORD_MIC_JS, base64.b64encode(data).decode(),
+                prep + self.RECORD_LEAD_PAD, self.RECORD_MAX_SECONDS)
+            if not state or not state.get('ok') or not state.get('dur'):
+                print("\t录音注入初始化失败")
+                return False
+            before = self._publish_record_state(q)
+            if not self._click_publish_record(q):
+                return False
+            started = True
+            deadline = time.monotonic() + prep + 15
+            while time.monotonic() < deadline and not self.stop_requested.is_set():
+                current = self._publish_record_state(q)
+                if current.get('calls', 0) > before.get('calls', 0):
+                    break
+                if self.stop_requested.wait(0.25):
+                    break
+            else:
+                current = {}
+            if not current or current.get('calls', 0) <= before.get('calls', 0):
+                print("\t录音器未启动，停止本题")
+                return False
+            if self.stop_requested.wait(float(state['dur']) + 1.0):
+                return False
+            if not self._click_publish_record(q):
+                return False
+            started = False
+            deadline = time.monotonic() + max(30.0, min(120.0, float(state['dur'])))
+            previous = set(before.get('uploaded') or [])
+            while time.monotonic() < deadline and not self.stop_requested.is_set():
+                current = self._publish_record_state(q)
+                if set(current.get('uploaded') or []) - previous:
+                    print("\t录音已上传")
+                    return True
+                if self.stop_requested.wait(0.5):
+                    break
+            print("\t未能确认录音上传完成，不提交")
+        except Exception as exc:
+            print(f"\t录音失败: {str(exc)[:80]}")
+        finally:
+            if started:
+                try:
+                    self._click_publish_record(q)
+                except Exception:
+                    pass
+        return False
+
+    def _click_publish_record(self, q: Question) -> bool:
+        buttons = q.element.find_elements(
+            By.CSS_SELECTOR,
+            '[class*="i-record_record-wave-wrapper"], [class*="result_re-record-wrapper"], '
+            '[class*="i-oral-reply_oral-base-re-record-wrapper"]')
+        return bool(buttons and WebDriverHelper.safe_click(self.driver, buttons[0]))
+
+    def _publish_record_state(self, q: Question) -> Dict[str, Any]:
+        return self.driver.execute_script("""
+            const root = arguments[0];
+            return {
+                calls: (window.__ucRec && window.__ucRec.calls) || 0,
+                uploaded: Array.from(root.querySelectorAll('audio[src]'))
+                    .filter(audio => !audio.closest('[class*="answer_sample-audio-wrapper"], ' +
+                        '[class*="sample-audio"], [class*="q-oral-vocabulary-content_media"], ' +
+                        '[data-lexical-node-type="insert-audio"]'))
+                    .map(audio => audio.getAttribute('src') || '')
+                    .filter(src => /^https?:/i.test(src))
+            };
+        """, q.element) or {}
+
+    def publish_record_uploaded(self, q: Question) -> bool:
+        return bool(self._publish_record_state(q).get('uploaded'))
+
     def reveal_group(self, group, stop_requested: Optional[threading.Event] = None) -> bool:
         """从外向内点击折叠标题，使隐藏题块真正可见，不修改页面的 hidden 状态。"""
         try:
@@ -3991,7 +7924,58 @@ class PublishAnswerExecutor(AnswerExecutor):
             return self._fill_true_false(question, answer)
         if question.q_type == QuestionType.DROPDOWN_SELECT:
             return self._fill_publish_dropdown(question, answer)
+        if question.q_type == QuestionType.LINK_MATCH:
+            return self._fill_link_match(question, answer)
         return super().execute(question, answer)
+
+    def _fill_sorting(self, q: Question, answer: str) -> bool:
+        selector = '[data-optionid][data-index]'
+        if not q.element.find_elements(By.CSS_SELECTOR, selector):
+            return super()._fill_sorting(q, answer)
+        order = self._parse_sorting_order(answer, [option.letter for option in q.options])
+        if not order:
+            return False
+        ids = {option.letter: option.element.get_attribute('data-optionid') for option in q.options}
+        expected = [ids[letter] for letter in order]
+        for target, option_id in enumerate(expected):
+            if self.stop_requested.is_set():
+                return False
+            rows = q.element.find_elements(By.CSS_SELECTOR, selector)
+            current = [row.get_attribute('data-optionid') for row in rows]
+            if current == expected:
+                return True
+            if option_id not in current:
+                return False
+            position = current.index(option_id)
+            if position == target:
+                continue
+            row = rows[position]
+            self.driver.execute_script('arguments[0].scrollIntoView({block: "center"});', q.element)
+            self.driver.execute_async_script("""
+                const row = arguments[0], target = arguments[1], done = arguments[2];
+                const handle = row.querySelector('[class*="q-drag_dragBox"]');
+                if (!handle) { done(false); return; }
+                const a = handle.getBoundingClientRect(), b = target.getBoundingClientRect();
+                const x = a.left + a.width / 2, y = a.top + a.height / 2;
+                const end = b.top + b.height / 2;
+                const fire = (node, type, yy, buttons = 1) => node.dispatchEvent(
+                    new MouseEvent(type, {view: window, bubbles: true, cancelable: true,
+                        clientX: x, clientY: yy, button: 0, buttons}));
+                fire(handle, 'mousedown', y);
+                setTimeout(() => {
+                    fire(document, 'mousemove', y - 12);
+                    setTimeout(() => {
+                        fire(document, 'mousemove', end);
+                        setTimeout(() => {
+                            fire(document, 'mouseup', end, 0);
+                            done(true);
+                        }, 250);
+                    }, 150);
+                }, 150);
+            """, row, rows[target])
+            self.stop_requested.wait(0.2)
+        return [row.get_attribute('data-optionid') for row in
+                q.element.find_elements(By.CSS_SELECTOR, selector)] == expected
 
     def _fill_fill_in(self, q: Question, answer: str) -> bool:
         if q.blank_count and q.blank_count != len(q.inputs):
@@ -4003,6 +7987,136 @@ class PublishAnswerExecutor(AnswerExecutor):
         if len(q.inputs) <= 1:
             return super()._fill_text(q, answer)
         return self._fill_required_inputs(q.inputs, self._parse_banked_answer(answer, len(q.inputs)))
+
+    # ---- 连线匹配 -------------------------------------------------------
+    # 画布是 React Flow：把手势模拟成真实鼠标才连得上。两个坑都踩过：
+    #   1. 不能用 ActionChains / CDP 的绝对坐标——阅读器 iframe 上方压着播放器外壳的
+    #      score-column 浮层，真实鼠标事件会被顶层文档接走，iframe 里一条都收不到；
+    #   2. 必须派发 MouseEvent 而不是 PointerEvent——把手的 React props 只挂了
+    #      onMouseDown / onTouchStart / onClick，没有 pointerdown。
+    # 所以这里在内容层文档里直接派发合成 MouseEvent，完全不碰坐标和命中测试。
+    LINK_STUB_JS = """
+    if (!window.__unipusLinkStub) {
+      window.__unipusLinkStub = true;
+      const noop = function () { return false; };
+      ['setPointerCapture', 'releasePointerCapture'].forEach((name) => {
+        try { Element.prototype[name] = noop; } catch (e) {}
+      });
+      try { Element.prototype.hasPointerCapture = function () { return true; }; } catch (e) {}
+    }
+    return true;
+    """
+
+    LINK_ONCE_JS = """
+    const group = arguments[0];
+    const sourceId = arguments[1];
+    const targetId = arguments[2];
+    const steps = 12;
+    const nodeOf = (id) => group.querySelector('.react-flow__node[data-id="' + id + '"]');
+    const sourceNode = nodeOf(sourceId);
+    const targetNode = nodeOf(targetId);
+    if (!sourceNode || !targetNode) return 'no-node';
+    const sourceHandle = sourceNode.querySelector('.react-flow__handle');
+    const targetHandle = targetNode.querySelector('.react-flow__handle');
+    if (!sourceHandle || !targetHandle) return 'no-handle';
+    const centerOf = (el) => {
+      const box = el.getBoundingClientRect();
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    };
+    const from = centerOf(sourceHandle);
+    const to = centerOf(targetHandle);
+    const fire = (el, type, point, buttons) => {
+      el.dispatchEvent(new MouseEvent(type, {
+        bubbles: true, cancelable: true, composed: true,
+        clientX: point.x, clientY: point.y,
+        button: 0, buttons: buttons, view: window,
+      }));
+    };
+    fire(sourceHandle, 'mousedown', from, 1);
+    for (let step = 1; step <= steps; step++) {
+      fire(sourceHandle, 'mousemove', {
+        x: from.x + (to.x - from.x) * step / steps,
+        y: from.y + (to.y - from.y) * step / steps,
+      }, 1);
+    }
+    fire(targetHandle, 'mousemove', to, 1);
+    fire(targetHandle, 'mouseup', to, 0);
+    return 'ok';
+    """
+
+    LINK_EDGES_JS = "return arguments[0].querySelectorAll('.react-flow__edge').length;"
+
+    def _link_stub(self) -> None:
+        try:
+            self.driver.execute_script(self.LINK_STUB_JS)
+        except Exception:
+            pass
+
+    def _link_edge_count(self, group) -> int:
+        try:
+            return int(self.driver.execute_script(self.LINK_EDGES_JS, group) or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _parse_link_answer(answer: str, prompt_count: int,
+                           option_count: int) -> List[Tuple[int, str]]:
+        """把「1.D 2.C 3.A」解析成 [(0, 'D'), (1, 'C'), (2, 'A')]；非法项直接丢弃。"""
+        pairs: List[Tuple[int, str]] = []
+        seen = set()
+        for number, letter in re.findall(r'(\d+)\s*[.\-:：)）]?\s*([A-Za-z])', answer or ''):
+            index = int(number) - 1
+            position = ord(letter.upper()) - 65
+            if not (0 <= index < prompt_count and 0 <= position < option_count):
+                continue
+            if index in seen:
+                continue
+            seen.add(index)
+            pairs.append((index, letter.upper()))
+        return pairs
+
+    def _fill_link_match(self, q: Question, answer: str) -> bool:
+        """按 AI 给出的配对逐条连线；画布上连线数与提示数一致才算成功。"""
+        group = q.group or q.element
+        prompts = [item for item in q.link_items if item.get('side') == 'right']
+        options = [item for item in q.link_items if item.get('side') == 'left']
+        if not prompts or not options:
+            print("\t连线匹配：画布节点不完整，跳过")
+            return False
+        letter_to_item = {chr(65 + index): item for index, item in enumerate(options)}
+        pairs = self._parse_link_answer(answer, len(prompts), len(options))
+        if not pairs:
+            print("\t连线匹配：未能从回答里解析出配对，跳过")
+            return False
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", group)
+        except Exception:
+            pass
+        self._link_stub()
+        before = self._link_edge_count(group)
+        linked = 0
+        for index, letter in pairs:
+            source = prompts[index]
+            target = letter_to_item.get(letter)
+            if not target:
+                continue
+            try:
+                result = self.driver.execute_script(
+                    self.LINK_ONCE_JS, group, source.get('id'), target.get('id'))
+            except Exception as exc:
+                print(f"\t连线匹配：{index + 1}→{letter} 异常 {type(exc).__name__}")
+                continue
+            time.sleep(0.35)
+            now = self._link_edge_count(group)
+            if result == 'ok' and now > before:
+                linked += 1
+                before = now
+            else:
+                print(f"\t连线匹配：{index + 1}→{letter} 未生成连线（{result}）")
+        after = self._link_edge_count(group)
+        print(f"\t连线匹配：连上 {linked} 组，画布共 {after} 条连线（提示 {len(prompts)} 条）")
+        return after >= len(prompts)
 
     def _fill_required_inputs(self, inputs: List[Any], answers: List[str]) -> bool:
         """整题的所有空位均有答案且实际写入成功，才能交给上层提交。"""
@@ -4653,17 +8767,231 @@ class ContentHandler(ABC):
 
 
 class DiscussionBoardHandler(ContentHandler):
-    """讨论板处理器"""
+    """讨论板处理器：读题 → 生成一段观点 → 发帖。"""
 
-    def __init__(self, driver):
+    def __init__(self, driver, ai_client=None, stop_requested: Optional[threading.Event] = None):
         self.driver = driver
+        self.ai_client = ai_client
+        self.stop_requested = stop_requested or threading.Event()
 
     def can_handle(self, question: Question) -> bool:
         return question.q_type == QuestionType.DISCUSSION_BOARD
 
     def handle(self, question: Question) -> bool:
-        print("     讨论板页面，无需作答")
-        return True
+        textarea = self._find_textarea()
+        if not textarea:
+            print("     讨论板未找到输入框，跳过")
+            return True
+
+        topic = self._topic_text()
+        print(f"     讨论板发帖：{topic[:60]}")
+
+        body = self._compose(topic)
+        if not body:
+            print("     讨论板内容生成失败，跳过")
+            return True
+
+        try:
+            textarea.click()
+            textarea.clear()
+        except Exception:
+            pass
+        filled = False
+        try:
+            self.driver.execute_script("""
+                const el = arguments[0], value = arguments[1];
+                el.focus();
+                const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+                if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; }
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                return el.value;
+            """, textarea, body)
+            filled = True
+        except Exception as exc:
+            print(f"     讨论板写入失败: {str(exc)[:50]}")
+        if not filled:
+            textarea.send_keys(body)
+
+        # 触发 antd 的字符计数与提交按钮状态
+        try:
+            textarea.send_keys(Keys.SPACE)
+            textarea.send_keys(Keys.BACKSPACE)
+        except Exception:
+            pass
+
+        if self.stop_requested.wait(0.6):
+            return False
+
+        submit = self._find_submit()
+        if not submit:
+            print("     讨论板未找到发布按钮")
+            return False
+        clicked = WebDriverHelper.safe_click(self.driver, submit)
+        if not clicked:
+            try:
+                self.driver.execute_script("""
+                    const btn = arguments[0];
+                    btn.scrollIntoView({block: 'center'});
+                    btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                    btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                    btn.click();
+                """, submit)
+                clicked = True
+            except Exception:
+                clicked = False
+        if not clicked:
+            return False
+
+        self.stop_requested.wait(2.5)
+        if self._posted_successfully():
+            print("     讨论板已发布")
+            return True
+        print("     讨论板发布后未检测到评论，可能被限流或需要人机验证")
+        return False
+
+    def _posted_successfully(self) -> bool:
+        try:
+            return bool(self.driver.execute_script("""
+                const area = document.querySelector('.ds-discussion-bottom textarea, textarea[placeholder*="评论"]');
+                if (area && (area.value || '').trim().length === 0) return true;
+                const text = document.body.innerText || '';
+                return /全部评论（[1-9]/.test(text);
+            """))
+        except Exception:
+            return False
+
+    def _find_textarea(self):
+        for selector in ('.ds-discussion-bottom textarea',
+                         'textarea[placeholder*="评论"]',
+                         '.ds-discussion-reply textarea'):
+            try:
+                for area in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                    if area.is_displayed():
+                        return area
+            except Exception:
+                continue
+        return None
+
+    def _find_submit(self):
+        # 优先点真正的 <button>：外层 .btns-submit 只是个容器，点了不会发帖
+        for selector in ('button.submit-btn',
+                         '.btns-submit button',
+                         '.ds-discussion-bottom-btns button',
+                         '.ds-discussion-bottom button',
+                         'button.ant-btn-default'):
+            try:
+                for btn in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                    text = re.sub(r'\s+', '', btn.text or '')
+                    if btn.is_displayed() and ('发布' in text or 'submit' in text.lower()):
+                        return btn
+            except Exception:
+                continue
+        return None
+
+    def _topic_text(self) -> str:
+        parts = []
+        try:
+            parts = self.driver.execute_script("""
+                const clean = t => (t || '').replace(/\\s+/g, ' ').trim();
+                const out = [];
+                const dir = document.querySelector('.layout-direction-container');
+                if (dir) out.push(clean(dir.innerText));
+                // 真正的问题通常是一个独立的段落/富文本块
+                for (const el of document.querySelectorAll('.component-htmlview, p, .question-common-abs-scoop')) {
+                  if (el.closest('.ds-discussion-bottom, [class*="recordList"], [class*="comment"], .layout-sidebar')) continue;
+                  const text = clean(el.innerText);
+                  if (text.length < 15 || text.length > 400) continue;
+                  if (text.includes('全部评论') || text.includes('我来评论')) continue;
+                  if (out.includes(text)) continue;
+                  out.push(text);
+                  if (out.length >= 3) break;
+                }
+                return out;
+            """) or []
+        except Exception:
+            parts = []
+        text = "\n".join([p for p in parts if p])[:1200]
+        if len(text) > 10:
+            return text
+        return ""
+
+    def _compose(self, topic: str) -> str:
+        if self.ai_client and topic:
+            prompt = (f"【讨论题】{topic}\n\n"
+                      "请用英文写一段 60-90 词、观点明确的讨论回复（3 个要点，可举例），"
+                      "直接输出正文，不要标题、不要编号、不要解释。")
+            try:
+                answer = self.ai_client.ask(prompt, retry_count=2, stop_requested=self.stop_requested)
+                if answer:
+                    return re.sub(r'^[\s"“”]+|[\s"“”]+$', '', answer).strip()[:1200]
+            except Exception as exc:
+                print(f"     讨论板生成失败: {str(exc)[:50]}")
+        return ""
+
+
+class AudioHandler(ContentHandler):
+    """完整播放纯听力任务，只有自然结束才算成功。"""
+
+    def __init__(self, driver, stop_requested: threading.Event):
+        self.driver = driver
+        self.stop_requested = stop_requested
+
+    def can_handle(self, question: Question) -> bool:
+        return question.q_type == QuestionType.AUDIO
+
+    def handle(self, question: Question) -> bool:
+        audios = question.element.find_elements(By.TAG_NAME, 'audio')
+        if not audios:
+            return False
+        for index, audio in enumerate(audios, 1):
+            if self.stop_requested.is_set():
+                return False
+            print(f"     播放第 {index}/{len(audios)} 段音频，等待完整播放...")
+            try:
+                self.driver.execute_script("""
+                    const audio = arguments[0];
+                    audio.loop = false;
+                    audio.playbackRate = 1;
+                    audio.currentTime = 0;
+                    audio.__ucampusPlayError = '';
+                    const playing = audio.play();
+                    if (playing && playing.catch) playing.catch(error => {
+                        audio.__ucampusPlayError = String(error);
+                    });
+                """, audio)
+                last_time = 0.0
+                progress_at = time.monotonic()
+                while not self.stop_requested.is_set():
+                    state = self.driver.execute_script("""
+                        const audio = arguments[0];
+                        return {time: audio.currentTime || 0, ended: audio.ended,
+                                error: !!audio.error || !!audio.__ucampusPlayError};
+                    """, audio) or {}
+                    current = float(state.get('time') or 0)
+                    if state.get('error'):
+                        print("     音频播放失败，保留任务以便重试")
+                        return False
+                    if state.get('ended') and current > 0:
+                        print(f"     第 {index} 段音频已完整播放（{current:.1f}s）")
+                        break
+                    if current > last_time:
+                        last_time, progress_at = current, time.monotonic()
+                    if time.monotonic() - progress_at > 30:
+                        print("     音频加载或播放停滞，保留任务以便重试")
+                        return False
+                    if self.stop_requested.wait(0.25):
+                        return False
+                else:
+                    return False
+            except Exception as exc:
+                print(f"     音频播放失败: {str(exc)[:80]}")
+                return False
+            finally:
+                try:
+                    self.driver.execute_script('arguments[0].pause();', audio)
+                except Exception:
+                    pass
+        return not self.stop_requested.is_set()
 
 
 class SelfCheckHandler(ContentHandler):
@@ -4748,8 +9076,10 @@ class VideoHandler(ContentHandler):
 
         self.video_transcript = ""
         self.current_video_url = ""
+        self.skip_transcription = False
+        self._transcript_lock = threading.Lock()
 
-    def _play_video_and_handle_popups(self):
+    def _play_video_and_handle_popups(self, on_transcript: Optional[Callable[[str], None]] = None):
         """播放视频并自动处理弹窗选择题（供外部预处理调用）"""
         if self.stop_requested.is_set():
             return
@@ -4761,13 +9091,20 @@ class VideoHandler(ContentHandler):
         video_url = video_info.get('url', '')
         duration = video_info.get('duration', 0)
 
-        if video_url and video_url == self.current_video_url and self.video_transcript:
-            print(f"      使用已缓存的视频转录（{len(self.video_transcript)}字符）")
-        else:
+        if video_url != self.current_video_url:
             self.current_video_url = video_url
+            self.video_transcript = ""
+        if self.video_transcript:
+            print(f"      使用已缓存的视频转录（{len(self.video_transcript)}字符）")
+        elif not self.skip_transcription:
             self.video_transcript = self._transcribe_video(video_url, duration)
         if self.stop_requested.is_set():
             return
+        if on_transcript:
+            try:
+                on_transcript(self.video_transcript)
+            except Exception as exc:
+                print(f"      预取答案启动失败: {str(exc)[:60]}")
         self.stop_monitoring.clear()
         self.popup_monitor_thread = threading.Thread(
             target=self._monitor_popup_questions,
@@ -4840,13 +9177,31 @@ class VideoHandler(ContentHandler):
             print(f"     音频识别失败: {str(e)[:50]}")
             return ""
 
+    def ensure_transcript(self, video_url: str = "") -> str:
+        if self.video_transcript:
+            return self.video_transcript
+        url = video_url or self.current_video_url
+        if not url:
+            info = self._get_video_info() or {}
+            url = info.get('url', '')
+        url = (url or '').split('#')[0]
+        if not url:
+            return ""
+        with self._transcript_lock:
+            if self.video_transcript:
+                return self.video_transcript
+            self.current_video_url = url
+            print("     补做视频转写...")
+            self.video_transcript = self._transcribe_video(url, 0)
+            return self.video_transcript
+
     def _play_video(self, duration: float):
         video = None
         try:
             video = self.driver.find_element(By.TAG_NAME, 'video')
 
             if duration > 0:
-                print(f"      ▶ 播放视频（{int(duration)}秒，2倍速）...")
+                print(f"      【播放】开始播放视频（{int(duration)} 秒，2 倍速）...")
                 self.driver.execute_script("""
                     arguments[0].playbackRate = 2.0;
                     arguments[0].muted = true;
@@ -4860,7 +9215,7 @@ class VideoHandler(ContentHandler):
                     arguments[0].muted = true;
                     arguments[0].play();
                 """, video)
-                print(f"      ⏳ 等待 10 秒...")
+                print(f"      【等待】等待 10 秒...")
                 self.stop_requested.wait(10)
 
         except Exception as e:
@@ -4897,6 +9252,9 @@ class VideoHandler(ContentHandler):
                         print("      [监视器]  未能解析题目")
                         continue
 
+                    if question_data['options'] and not self.video_transcript:
+                        # 播放中才弹题时补转写，避免只能随机猜。
+                        self.ensure_transcript()
                     if self.video_transcript and question_data['options']:
                         answer = self._intelligent_select_answer(question_data)
                     else:
@@ -5311,6 +9669,67 @@ class FlashcardHandler(ContentHandler):
         return None
 
 
+PAGE_SCORE_JS = r"""
+    const clean = t => (t || '').replace(/\s+/g, ' ').trim();
+    const visible = e => !!(e && e.getClientRects().length);
+    const body = clean(document.body.innerText);
+    // 提交后一般会落到答题小结，先认总分/得分，再按行取分数
+    const summary = body.match(/(?:得分|成绩|分数|总分)\s*[:：]?\s*(\d{1,3}(?:\.\d+)?)/)
+                 || body.match(/(\d{1,3}(?:\.\d+)?)\s*分/);
+    if (summary) return parseFloat(summary[1]);
+    const scores = [];
+    for (const el of document.querySelectorAll('.score_layout')) {
+        if (!visible(el)) continue;
+        const hit = clean(el.innerText).match(/(\d{1,3}(?:\.\d+)?)/);
+        if (hit) scores.push(parseFloat(hit[1]));
+    }
+    if (!scores.length) return null;
+    if (scores.length === 1) return scores[0];
+    // 一页多行（逐句跟读等）取平均，平台按整题算一个分
+    return Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10;
+"""
+
+
+class AnswerPrefetch:
+    """后台预取 AI 答案；只做网络请求，不碰 Selenium。"""
+
+    def __init__(self, client, prompt: str, screenshot: Optional[bytes],
+                 stop_requested: threading.Event):
+        self.client = client
+        self.materials = tuple((m['role'], m['content']) for m in client.material_messages)
+        self.prompt = prompt
+        self.screenshot = screenshot
+        self.stop_requested = stop_requested
+        self.answer: Optional[str] = None
+        self.error: Optional[Exception] = None
+        self.started = time.monotonic()
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self.answer = self.client.ask(
+                self.prompt, stop_requested=self.stop_requested,
+                screenshot=self.screenshot, remember=False)
+        except Exception as exc:
+            self.error = exc
+        finally:
+            self._done.set()
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def wait(self, timeout: Optional[float] = None) -> Optional[str]:
+        self._done.wait(timeout)
+        return self.answer
+
+
 class AISolver:
     """AI答题器 - 协调解析、构建、执行流程"""
 
@@ -5320,23 +9739,37 @@ class AISolver:
         self.stop_requested = threading.Event()
         self.ai_client = OpenAICompatibleClient(self.config)
         self.parser = QuestionParser(driver)
-        self.prompt_builder = PromptBuilder(self.ai_client)
-        self.executor = AnswerExecutor(driver)
+        # Vocabulary 页收来的中英对照：Exercise 1 的填空、Exercise 2 的口语稿都吃它
+        self.vocab_store = VocabularyStore()
+        self.tts_engine = TTSEngine(
+            getattr(config, 'tts_engine', 'auto') or 'auto',
+            getattr(config, 'tts_voice', '') or '',
+            getattr(config, 'tts_proxy', '') or '',
+        )
+        self.prompt_builder = PromptBuilder(self.ai_client, vocab_store=self.vocab_store)
+        self.executor = AnswerExecutor(driver, tts=self.tts_engine,
+                                       stop_requested=self.stop_requested)
         self.publish_parser = PublishQuestionParser(driver)
-        self.publish_executor = PublishAnswerExecutor(driver)
+        self.publish_executor = PublishAnswerExecutor(driver, tts=self.tts_engine,
+                                                      stop_requested=self.stop_requested)
         self.video_handler = VideoHandler(driver, self.config, self.stop_requested)
         self.content_handlers: List[ContentHandler] = [
+            AudioHandler(driver, self.stop_requested),
             self.video_handler,
             FlashcardHandler(driver, self.stop_requested),
             SelfCheckHandler(driver, self.stop_requested),
-            DiscussionBoardHandler(driver),
+            DiscussionBoardHandler(driver, self.ai_client, self.stop_requested),
         ]
         self.processed_hashes: set = set()
         self._processed_video_tabs: set = set()
+        self._skipped_video_tabs: set = set()
         self._processed_audio_tabs: set = set()
+        self._processed_audio_context = self.ai_client.material_messages
         self._publish_processed_groups: set = set()
         self._publish_scope: Optional[PublishTaskScope] = None
         self._publish_scope_url: str = ''
+        self._retry_hint: str = ''
+        self._last_question_types: set = set()
 
     def request_stop(self):
         self.stop_requested.set()
@@ -5347,10 +9780,12 @@ class AISolver:
     def _should_stop(self) -> bool:
         return self.stop_requested.is_set()
 
-    def process_selected_tabs(self, selected_tabs: List[Dict], chapter_name: str = ""):
+    def process_selected_tabs(self, selected_tabs: List[Dict], chapter_name: str = "",
+                              on_task_done: Optional[Callable[[Dict], None]] = None):
         """
         按用户勾选的 Tab 列表逐个处理（自动模式）。
         selected_tabs: 完整的 tab dict 列表（来自扫描结果）
+        on_task_done: 单个任务处理完后的回调，GUI 用它来取消勾选 / 更新状态
         """
         if not chapter_name:
             chapter_name = "selected_chapter"
@@ -5363,124 +9798,825 @@ class AISolver:
         self.processed_hashes.clear()
         self._publish_processed_groups = set()
 
-        course_home_url = self.driver.current_url
+        course_home_url = selected_tabs[0].get('_directory_url') if selected_tabs else ''
+        course_home_url = course_home_url or self.driver.current_url
 
         for task_idx, tab in enumerate(selected_tabs):
             if self._should_stop():
                 print("  已请求停止，批量处理提前结束")
                 break
 
-            tab_name = tab.get('l1_title', 'unknown')
+            print(f"\n  [{task_idx + 1}/{len(selected_tabs)}] {tab.get('display') or tab.get('l1_title', '')}")
+            try:
+                status = self._process_selected_tab(tab, task_idx, len(selected_tabs), chapter_name, course_home_url)
+            except Exception as exc:
+                print(f"  该任务处理异常，已保留勾选，下次会从这里继续: {str(exc)[:120]}")
+                logger.error(f"任务处理异常: {exc}", exc_info=True)
+                status = 'error'
 
-            if '_element' in tab and tab['_element'] is not None:
-                print(f"\n  [{task_idx+1}/{len(selected_tabs)}] {tab['display']}")
-
-                if task_idx > 0:
-                    self.driver.get(course_home_url)
-                    if self.stop_requested.wait(3):
-                        break
-                    self.ai_client.force_reset(f"{chapter_name}_{tab_name}")
-
-                if '_unit_idx' in tab:
+            if status == 'done':
+                self._retry_hint = ''
+                score = self._read_task_score()
+                # 朗读题评分是提交后异步返回的，页面立即读可能为空；
+                # 最多等 30 秒再判定“无分数”，避免把未出分当成完成。
+                if score is None and getattr(self, '_last_question_types', set()) & {
+                        QuestionType.RECORD, QuestionType.ORAL_ALOUD,
+                        QuestionType.MY_VOICE_TEXT}:
+                    for _ in range(15):
+                        if self.stop_requested.wait(2):
+                            break
+                        score = self._read_task_score()
+                        if score is not None:
+                            print(f"  朗读评分已返回: {score:g}")
+                            break
+                retries = 0
+                retry_status = status
+                while score is not None and self._score_is_abnormal(score) and retries < 3:
+                    retries += 1
+                    hint = self._read_answer_analysis()
+                    self._retry_hint = hint
+                    print(f"  本次得分 {score:g} 偏低，"
+                          f"{'使用答案解析' if hint else '用 AI 重做'}（第 {retries}/3 次）")
+                    logger.warning("分数异常重试 %s: %.1f -> %s", tab.get('display'), score,
+                                   '答案解析' if hint else 'AI 重做')
+                    # 重做同一页时必须清掉去重标记，否则会被“已处理过”直接跳过。
+                    self.processed_hashes.clear()
+                    if hasattr(self, '_publish_processed_groups'):
+                        self._publish_processed_groups.clear()
                     try:
-                        unit_container = WebDriverWait(self.driver, 10).until(
-                            EC.presence_of_element_located(
-                                (By.CLASS_NAME, 'unipus-tabs_unitTabScrollContainer__fXBxR'))
-                        )
-                        unit_tabs = unit_container.find_elements(By.CSS_SELECTOR, ':scope > *')
-                        if tab['_unit_idx'] >= len(unit_tabs):
-                            print("    目标Unit不存在，跳过")
-                            continue
-                        if self._should_stop():
-                            break
-                        self.driver.execute_script("arguments[0].click();", unit_tabs[tab['_unit_idx']])
-                        if self.stop_requested.wait(1.2):
-                            break
-                    except Exception as e:
-                        print(f"    切换Unit失败: {str(e)[:50]}")
-                        continue
+                        retry_status = self._process_selected_tab(
+                            tab, task_idx, len(selected_tabs), chapter_name, course_home_url)
+                    except Exception as exc:
+                        logger.error(f"重做任务异常: {exc}", exc_info=True)
+                        retry_status = 'error'
+                    if retry_status != 'done':
+                        break
+                    score = self._read_task_score()
 
-                chapter_clicked = False
-                try:
-                    chapters = self.driver.find_elements(
-                        By.CSS_SELECTOR, '[class*="courses-unit_taskItemInnerLayout__"], [class*="courses-unit_nodeItemInnerLayout__"]'
-                    )
-                    name_occurrence = 0
-                    for ch in chapters:
-                        if self._should_stop():
-                            break
+                if retry_status != 'done':
+                    # 重做出错或被中断时不能算完成：保持未完成状态，
+                    # 不写 session_score、不调用 on_task_done，下次仍可重做。
+                    print(f"  重做未完成（{retry_status}），保留任务状态，不标记完成")
+                    logger.warning("分数异常重做未完成 %s: status=%s",
+                                   tab.get('display'), retry_status)
+                    if retry_status == 'error':
+                        self._retry_hint = ''
+                        tab['status'] = 'error'
+                        tab['status_text'] = '重做失败'
+                        tab['score_abnormal'] = True
+                        break
+                else:
+                    tab['status'] = 'done'
+                    tab['status_text'] = '已完成'
+                    tab['session_score'] = score
+                    if score is not None:
+                        tab['score'] = score
+                        print(f"  本次得分 {score:g}")
+                    if score is not None and self._score_is_abnormal(score):
+                        tab['score_abnormal'] = True
+                        logger.error("任务分数仍异常 %s: %.1f（已重试 %d 次）",
+                                     tab.get('display'), score, retries)
+                        print(f"  分数仍异常，标记红色并跳到下一题")
+                    else:
+                        tab['score_abnormal'] = False
+                    if on_task_done:
                         try:
-                            name_elem = ch.find_element(By.CSS_SELECTOR, '[class*="courses-unit_taskTypeName__"], [class*="courses-unit_nodeTypeName__"]')
-                            if name_elem.text.strip() == tab_name:
-                                if name_occurrence == tab.get('_name_occurrence', 0):
-                                    if self._should_stop():
-                                        break
-                                    self.driver.execute_script("arguments[0].click();", name_elem)
-                                    chapter_clicked = True
-                                    break
-                                name_occurrence += 1
-                        except:
-                            continue
-                except Exception as e:
-                    print(f"    重新定位章节失败: {str(e)[:50]}")
+                            on_task_done(tab)
+                        except Exception as exc:
+                            print(f"  完成回调异常: {str(exc)[:60]}")
+            elif status == 'error':
+                print("  已中断批量处理；剩余勾选保持原样，可直接从这里继续")
+                break
 
-                if self._should_stop():
-                    break
-                if chapter_clicked:
-                    if self.stop_requested.wait(3):
-                        break
-                    self._process_tab_with_accumulation(tab_name, task_idx, 0)
-                    if self.stop_requested.wait(2):
-                        break
-                else:
-                    print(f"  点击章节失败，跳过")
+            if self.stop_requested.wait(0.5):
+                break
 
-            else:
-                l1_idx = tab.get('l1_idx', 0)
-                l2_idx = tab.get('l2_idx', -1)
+        self._release_transcriber()
 
-                level1_tabs = self._get_level1_tabs()
-                if l1_idx >= len(level1_tabs):
-                    print(f"  一级Tab索引 {l1_idx} 越界，跳过")
-                    continue
-
-                l1_tab = level1_tabs[l1_idx]
-                print(f"\n  [{task_idx+1}/{len(selected_tabs)}] 一级Tab: {l1_tab['title']}")
-
-                if self._should_stop():
-                    break
-                if not WebDriverHelper.safe_click(self.driver, l1_tab['element']):
-                    print(f"  点击一级Tab失败，跳过")
-                    continue
-                if self.stop_requested.wait(1.5):
-                    break
-                if l2_idx < 0:
-                    self._process_tab_with_accumulation(l1_tab['title'], l1_idx, 0)
-                    if self.stop_requested.wait(2):
-                        break
-                else:
-                    level2_tabs = self._get_level2_tabs()
-                    if l2_idx >= len(level2_tabs):
-                        print(f"  二级Tab索引 {l2_idx} 越界，跳过")
-                        continue
-
-                    l2_tab = level2_tabs[l2_idx]
-                    print(f"    二级Tab: {l2_tab['title']}")
-
-                    if self._should_stop():
-                        break
-                    if not WebDriverHelper.safe_click(self.driver, l2_tab['element']):
-                        print(f"  点击二级Tab失败，跳过")
-                        continue
-                    if self.stop_requested.wait(1.5):
-                        break
-                    combined_name = f"{l1_tab['title']}_{l2_tab['title']}"
-                    self._process_tab_with_accumulation(combined_name, l1_idx, l2_idx)
-                    if self.stop_requested.wait(2):
-                        break
         print(f"\n{'=' * 60}")
         print("批量处理已停止" if self._should_stop() else f"全部 {len(selected_tabs)} 个任务处理完毕")
         print(f"{'=' * 60}")
+
+    def _score_is_abnormal(self, score: float) -> bool:
+        types = getattr(self, '_last_question_types', set())
+        record_types = {QuestionType.RECORD, QuestionType.ORAL_ALOUD,
+                        QuestionType.MY_VOICE_TEXT}
+        threshold = 80 if types & record_types else 100
+        return score < threshold
+
+    def _read_answer_analysis(self) -> str:
+        """提交后的答案解析；页面没有时返回空串。"""
+        js = """
+        const nodes = Array.from(document.querySelectorAll(
+            '[class*="analysis"], [class*="answer-detail"], [class*="correct-answer"], .answer-content'));
+        const text = nodes.filter(n => n.offsetParent !== null).map(n => n.innerText || '').join('\\n');
+        const match = text.match(/(正确答案|参考答案|答案解析)[\\s\\S]{0,1500}/);
+        return match ? match[0].slice(0, 1500) : '';
+        """
+        try:
+            value = self.driver.execute_script(js)
+            return value.strip() if isinstance(value, str) else ''
+        except Exception:
+            return ''
+
+    def _read_task_score(self) -> Optional[float]:
+        """页面上当前这次作答的分数；还没出分或认不出来时返回 None。"""
+        try:
+            value = self.driver.execute_script(PAGE_SCORE_JS)
+        except Exception:
+            return None
+        if isinstance(value, (int, float)) and 0 <= value <= 100:
+            return round(float(value), 1)
+        return None
+
+    def _process_selected_tab(self, tab: Dict, task_idx: int, total: int,
+                              chapter_name: str, course_home_url: str) -> str:
+        """处理单个选中任务，返回 done / skipped / stopped / error。"""
+        tab_name = tab.get('l1_title', 'unknown')
+
+        if self._should_stop():
+            return 'stopped'
+
+        # 每个任务页都可能自带 Learning / Practicing 标签，逐个任务重新判断
+        self._inline_learning_tried = False
+
+        # Collocation（搭配填空）要求「从课文里找搭配」，先把同单元 Reading the text 当上下文
+        section_text = ' '.join([
+            str(tab.get('section') or ''),
+            str(tab.get('l2_title') or ''),
+            str(tab.get('display') or ''),
+        ]).lower()
+        if 'collocation' in section_text and tab.get('_unit_idx') is not None:
+            self._load_reading_context(course_home_url, tab.get('_unit_idx'),
+                                      section_filter=str(tab.get('section') or tab.get('l2_title') or ''))
+            if self._should_stop():
+                return 'stopped'
+
+        if '_element' in tab and tab['_element'] is not None:
+            if task_idx > 0 or self.driver.current_url != course_home_url:
+                self.driver.get(course_home_url)
+                if self.stop_requested.wait(3):
+                    return 'stopped'
+                self.ai_client.force_reset(f"{chapter_name}_{tab_name}")
+
+            if '_unit_idx' in tab:
+                try:
+                    unit_container = WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, '[class*="unitTabScrollContainer"]'))
+                    )
+                    unit_tabs = unit_container.find_elements(By.CSS_SELECTOR, ':scope > *')
+                    if tab['_unit_idx'] >= len(unit_tabs):
+                        print("    目标Unit不存在，跳过")
+                        return 'skipped'
+                    if self._should_stop():
+                        return 'stopped'
+                    self.driver.execute_script("arguments[0].click();", unit_tabs[tab['_unit_idx']])
+                    if self.stop_requested.wait(1.2):
+                        return 'stopped'
+                except Exception as e:
+                    print(f"    切换Unit失败: {str(e)[:50]}")
+                    return 'skipped'
+
+            chapter_clicked = False
+            try:
+                chapters = self.driver.find_elements(
+                    By.CSS_SELECTOR, '[class*="taskItemInnerLayout"], [class*="nodeItemInnerLayout"]'
+                )
+                name_occurrence = 0
+                for ch in chapters:
+                    if self._should_stop():
+                        return 'stopped'
+                    try:
+                        if not ch.is_displayed():
+                            continue
+                        name_elem = ch.find_element(
+                            By.CSS_SELECTOR, '[class*="taskTypeName"], [class*="nodeTypeName"]')
+                        if name_elem.text.strip() == tab_name:
+                            if name_occurrence == tab.get('_name_occurrence', 0):
+                                self.driver.execute_script("arguments[0].click();", name_elem)
+                                chapter_clicked = True
+                                break
+                            name_occurrence += 1
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"    重新定位章节失败: {str(e)[:50]}")
+
+            if self._should_stop():
+                return 'stopped'
+            if not chapter_clicked:
+                print("  点击章节失败，跳过")
+                return 'skipped'
+            if self.stop_requested.wait(3):
+                return 'stopped'
+            success = self._process_tab_with_accumulation(tab_name, task_idx, 0)
+            return 'stopped' if self._should_stop() else ('done' if success else 'error')
+
+        l1_idx = tab.get('l1_idx', 0)
+        l2_idx = tab.get('l2_idx', -1)
+
+        level1_tabs = self._get_level1_tabs()
+        if l1_idx >= len(level1_tabs):
+            print(f"  一级Tab索引 {l1_idx} 越界，跳过")
+            return 'skipped'
+
+        l1_tab = level1_tabs[l1_idx]
+        print(f"    一级Tab: {l1_tab['title']}")
+
+        if self._should_stop():
+            return 'stopped'
+        if not WebDriverHelper.safe_click(self.driver, l1_tab['element']):
+            print(f"  点击一级Tab失败，跳过")
+            return 'skipped'
+        if self.stop_requested.wait(1.5):
+            return 'stopped'
+        if l2_idx < 0:
+            success = self._process_tab_with_accumulation(l1_tab['title'], l1_idx, 0)
+            return 'stopped' if self._should_stop() else ('done' if success else 'error')
+
+        level2_tabs = self._get_level2_tabs()
+        if l2_idx >= len(level2_tabs):
+            print(f"  二级Tab索引 {l2_idx} 越界，跳过")
+            return 'skipped'
+
+        l2_tab = level2_tabs[l2_idx]
+        print(f"    二级Tab: {l2_tab['title']}")
+
+        if self._should_stop():
+            return 'stopped'
+        if not WebDriverHelper.safe_click(self.driver, l2_tab['element']):
+            print(f"  点击二级Tab失败，跳过")
+            return 'skipped'
+        if self.stop_requested.wait(1.5):
+            return 'stopped'
+        combined_name = f"{l1_tab['title']}_{l2_tab['title']}"
+        success = self._process_tab_with_accumulation(combined_name, l1_idx, l2_idx)
+        return 'stopped' if self._should_stop() else ('done' if success else 'error')
+
+    def _answer_chunked_fill(self, q: Question, directions: str = "", chunk_size: int = 8) -> bool:
+        """空位很多的填空题拆成小块问模型，按「全局空号」写回，全部填上才算成功。"""
+        total = len(q.inputs)
+        if not total:
+            return False
+        filled = 0
+        used_answers: List[str] = []
+        print(f"    空位较多（{total} 个），拆成每 {chunk_size} 空一批作答")
+
+        pending = [(start, min(start + chunk_size, total)) for start in range(0, total, chunk_size)]
+        # 从题面 + 课文上下文里给每个空列出「以已给字母开头的候选词」，
+        # 模型在搭配填空里最容易错的就是挑同前缀的其它词，给候选能明显纠偏。
+        corpus = q.text or ""
+        try:
+            corpus += " " + " ".join(m.get('content', '') for m in self.ai_client.material_messages)
+        except Exception:
+            pass
+        corpus_words = re.findall(r"[A-Za-z][A-Za-z'-]{2,}", corpus)
+        while pending:
+            if self._should_stop():
+                return False
+            start, end = pending.pop(0)
+            sub_blanks = [dict(b) for b in q.banked_blanks[start:end]]
+            for item in sub_blanks:
+                hint = (item.get('hint') or '').strip()
+                if not hint:
+                    continue
+                seen = []
+                for word in corpus_words:
+                    if word.lower().startswith(hint.lower()) and len(word) > len(hint):
+                        if word.lower() not in [w.lower() for w in seen]:
+                            seen.append(word)
+                    if len(seen) >= 8:
+                        break
+                item['candidates'] = seen
+            sub = Question(
+                number=q.number,
+                text=q.text,
+                q_type=q.q_type,
+                element=q.element,
+                inputs=q.inputs[start:end],
+                banked_blanks=sub_blanks,
+                banked_options=q.banked_options,
+                directions=q.directions,
+            )
+            prompt = self.prompt_builder.build([sub], directions)
+            if not prompt:
+                continue
+            prompt += (f"\n本批只包含第 {start + 1}-{end} 空，请按这些空号作答，"
+                       f"格式：{start + 1}.答案 {start + 2}.答案 ...")
+            if used_answers and re.search(r'\b(?:only\s+once|once\s+only)\b', q.directions or '', re.I):
+                prompt += ("\n【已用答案】前面批次已填入：" + "；".join(used_answers) +
+                           "。词库里的每个表达只能用一次，本批不得重复使用，"
+                           "请优先选取尚未使用的表达。")
+            response = self.ai_client.ask(prompt, stop_requested=self.stop_requested,
+                                          screenshot=self._question_screenshot([q]))
+            if not response:
+                # 推理型模型偶尔整批返回空（token 全烧在思考上），把这批再拆小重问
+                if end - start > 2:
+                    mid = (start + end) // 2
+                    print(f"    第 {start + 1}-{end} 空无答案，拆成两批重试")
+                    pending[0:0] = [(start, mid), (mid, end)]
+                else:
+                    # 只剩 1-2 个空还拿不到答案：换一种更短的问法再试一次
+                    retry_prompt = (f"【填空】请只回答第 {start + 1}-{end} 空，"
+                                    f"每空一个答案（可以是多词短语），格式：{start + 1}.答案\n"
+                                    f"{q.text[:1200]}")
+                    for item in sub_blanks:
+                        retry_prompt += f"\n空{item['index'] + 1}: 提示 {item.get('hint', '') or '无'}；前文 {item.get('context', '')[-80:]}"
+                    response = self.ai_client.ask(retry_prompt, retry_count=1,
+                                                  stop_requested=self.stop_requested)
+                if not response:
+                    print(f"    第 {start + 1}-{end} 空未拿到答案，跳过")
+                    continue
+
+            mapping = self._parse_numbered_map(response)
+            for offset, inp in enumerate(sub.inputs):
+                global_no = start + offset + 1
+                ans = mapping.get(global_no) or mapping.get(offset + 1) or ""
+                if not ans:
+                    continue
+                hint = sub_blanks[offset].get('hint', '') if offset < len(sub_blanks) else ''
+                ans = self.executor._strip_given_prefix(hint, ans)
+                try:
+                    if self.executor._fill_text_input_verified(inp, ans):
+                        filled += 1
+                        used_answers.append(ans)
+                except Exception as exc:
+                    print(f"    空{global_no} 写入失败: {str(exc)[:50]}")
+            print(f"    第 {start + 1}-{end} 空已处理（累计 {filled}/{total}）")
+
+        return filled == total
+
+    @staticmethod
+    def _parse_numbered_map(text: str) -> Dict[int, str]:
+        """把 "1.on average 2.come across" 解析成 {1: 'on average', 2: 'come across'}。
+
+        答案经常是多词短语（on average / with respect to / turn one's nose up），
+        必须在「下一个编号」处截断，不能按空格切。老实现按非空白字符匹配，只取到首个单词，
+        结果把 on average 回填成 on、come across 回填成 come，整题判错。
+        """
+        result: Dict[int, str] = {}
+        if not (text or '').strip():
+            return result
+        marker = re.compile(r'(?:^|[\s,;，；])(?:空\s*)?(\d{1,2})\s*[.、:：)）]')
+        matches = list(marker.finditer(text))
+        for i, match in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            value = text[match.end():end].strip().strip(' .,;，。；')
+            if value:
+                result.setdefault(int(match.group(1)), value)
+        if not result:
+            # 没有编号时按行降级，仍然保留整行的多词内容
+            for line in (text or '').splitlines():
+                cleaned = re.sub(r'^\s*(?:空\s*)?\d{1,2}\s*[.、:：)）]\s*', '', line)
+                cleaned = cleaned.strip().strip(' .,;，。；')
+                if cleaned:
+                    result[len(result) + 1] = cleaned
+        return result
+
+    def _load_reading_context_for_current_page(self) -> bool:
+        """快速模式用：先试当前页切 Learning；不行再从播放器页反推单元去目录找。"""
+        if getattr(self, '_reading_ctx_tried', False):
+            return False
+        self._reading_ctx_tried = True
+
+        if self._load_learning_inline():
+            return True
+
+        url = self.driver.current_url or ""
+        resource_id = ""
+        try:
+            query = parse_qs(urlsplit(url).query)
+            resource_id = (query.get('courseResourceId') or [""])[0]
+        except Exception:
+            resource_id = ""
+        if not resource_id:
+            print("    搭配学习页：当前页没有 courseResourceId，跳过")
+            return False
+
+        unit_label = self._unit_label_from_page()
+        if not unit_label:
+            print("    搭配学习页：认不出当前单元，跳过")
+            return False
+
+        directory_url = f"https://ucloud.unipus.cn/app/cmgt/resource-detail/{resource_id}"
+        print(f"    搭配学习页：当前单元 {unit_label}，准备读取同单元 Learning 页")
+        try:
+            self._context_reference_text = self.driver.find_element(By.TAG_NAME, 'body').text or ""
+        except Exception:
+            self._context_reference_text = ""
+        return self._load_reading_context(directory_url, unit_label=unit_label)
+
+    def _unit_label_from_page(self) -> str:
+        """从面包屑「课程 > 单元标题 > 板块」+ 侧栏「Unit N 单元标题」反推 Unit 编号。"""
+        try:
+            body = self.driver.find_element(By.TAG_NAME, 'body').text or ""
+        except Exception:
+            return ""
+        first_line = next((line.strip() for line in body.splitlines() if line.strip()), "")
+        head = body[:800] if body else ""
+        breadcrumb = [part.strip() for part in head.split('>') if part.strip()]
+        if not first_line or len(breadcrumb) < 2:
+            breadcrumb = [part.strip() for part in first_line.split('>') if part.strip()]
+        unit_title = breadcrumb[1] if len(breadcrumb) >= 2 else ""
+
+        items = []
+        try:
+            items = self.driver.execute_script("""
+                const out = [];
+                for (const el of document.querySelectorAll('div, span, li, a')) {
+                  const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                  if (text.length > 80) continue;
+                  if (!/^Unit\\s*\\d+\\b/i.test(text)) continue;
+                  if (out.includes(text)) continue;
+                  out.push(text);
+                }
+                return out;
+            """) or []
+        except Exception:
+            items = []
+
+        if unit_title:
+            probe = re.sub(r'\W+', '', unit_title).lower()
+            for item in items:
+                match = re.match(r'(Unit\s*\d+)\s*(.*)', item, re.I)
+                if not match:
+                    continue
+                title_part = re.sub(r'\W+', '', match.group(2) or '').lower()
+                # 侧栏标题会被省略成 "When work is a pleasu..."，用前缀匹配
+                if probe and title_part and (title_part.startswith(probe[:10])
+                                             or probe.startswith(title_part[:10])):
+                    return match.group(1)
+        if items:
+            print(f"    搭配学习页：侧栏单元标题没对上（{unit_title or '无面包屑'}），候选: {items[:6]}")
+        return ""
+
+    def _load_learning_inline(self) -> bool:
+        """当前页顶部就有 Learning / Practicing 标签，直接切过去读答案页再切回来。
+
+        比绕目录更准：Learning 一定是当前 Practicing 的同一分组，不会读错。
+        """
+        if getattr(self, '_inline_learning_tried', False):
+            return False
+        self._inline_learning_tried = True
+        try:
+            tabs = [t for t in self.driver.find_elements(By.CSS_SELECTOR, '[class*="pc-header-tab"]')
+                    if t.is_displayed()]
+        except Exception:
+            return False
+
+        learning = next((t for t in tabs if (t.text or '').strip().lower() == 'learning'), None)
+        practicing = next((t for t in tabs if (t.text or '').strip().lower() == 'practicing'), None)
+        if learning is None:
+            return False
+
+        try:
+            self.driver.execute_script("arguments[0].click();", learning)
+        except Exception:
+            return False
+        time.sleep(5)
+
+        text = ""
+        try:
+            text = self.driver.execute_script("""
+                const clean = t => (t || '').replace(/\\s+/g, ' ').trim();
+                let text = clean(document.body.innerText);
+                const cut = text.indexOf('目录笔记');
+                if (cut > 200) text = text.slice(0, cut);
+                return text.slice(0, 7000);
+            """) or ""
+        except Exception:
+            text = ""
+
+        if practicing is not None:
+            try:
+                self.driver.execute_script("arguments[0].click();", practicing)
+            except Exception:
+                pass
+            time.sleep(4)
+
+        if len(text) < 120:
+            print("    搭配学习页：Learning 页没抓到内容，跳过")
+            return False
+
+        self._inline_learning_chars = len(text)
+        self.ai_client.add_passage_if_new(text)
+        print(f"    搭配学习页：当前页切到 Learning 抓到 {len(text)} 字符，已加入上下文")
+        return True
+
+    def _load_reading_context(self, directory_url: str, unit_idx: Optional[int] = None,
+                              unit_label: str = "", section_filter: str = "") -> bool:
+        """把搭配答案页作为上下文：优先当前页切 Learning，失败再绕目录找。"""
+        if self._load_learning_inline():
+            # Learning 页就是「已填好的讲解版」，内容够充实就不用再拉课文
+            if getattr(self, '_inline_learning_chars', 0) >= 400:
+                return True
+            print("    搭配学习页：Learning 内容太短，改用同单元 Reading the text 兜底")
+        if not directory_url or (unit_idx is None and not unit_label):
+            return False
+        if getattr(self, '_loaded_reading_units', None) is None:
+            self._loaded_reading_units = set()
+        cache_key = (directory_url, unit_idx, (unit_label or '').lower(), section_filter.lower())
+        if cache_key in self._loaded_reading_units:
+            return True
+
+        try:
+            original = self.driver.current_window_handle
+        except Exception:
+            original = None
+
+        try:
+            self.driver.switch_to.new_window('tab')
+
+            def open_unit():
+                self.driver.get(directory_url)
+                WebDriverWait(self.driver, 25).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, '[class*="unitTabScrollContainer"]')))
+                time.sleep(1.5)
+                tabs = self.driver.find_elements(By.CSS_SELECTOR, '[class*="unitTabScrollContainer"] > *')
+                target = None
+                if unit_label:
+                    wanted = re.sub(r'\s+', '', unit_label).lower()
+                    for tab in tabs:
+                        if wanted and wanted in re.sub(r'\s+', '', (tab.text or '')).lower():
+                            target = tab
+                            break
+                elif unit_idx is not None and unit_idx < len(tabs):
+                    target = tabs[unit_idx]
+                if target is None:
+                    return False
+                self.driver.execute_script("arguments[0].click();", target)
+                time.sleep(1.5)
+                return True
+
+            if not open_unit():
+                print(f"    搭配学习页：目录里找不到 {unit_label or unit_idx}，跳过")
+                return False
+
+            candidates = self.driver.execute_script("""
+                const clean = t => (t || '').replace(/\\s+/g, ' ').trim();
+                const all = [...document.querySelectorAll('[class*="taskItemInnerLayout"]')];
+                const out = [];
+                all.forEach((el, index) => {
+                  if (!el.getClientRects().length) return;
+                  const nameEl = el.querySelector('[class*="taskTypeName"]');
+                  const name = clean(nameEl && nameEl.innerText).toLowerCase();
+                  if (!name.includes('learning')) return;
+                  const path = [];
+                  let p = el;
+                  while ((p = p.parentElement)) {
+                    const head = p.querySelector(':scope > .ant-collapse-header');
+                    if (head) path.unshift(clean(head.innerText));
+                  }
+                  if (!path.join(' / ').toLowerCase().includes('collocation')) return;
+                  out.push({index, path: path.join(' / '), name});
+                });
+                return out;
+            """) or []
+
+            if section_filter:
+                wanted = re.sub(r'\s+', '', section_filter).lower()
+                filtered = [c for c in candidates
+                            if wanted and wanted in re.sub(r'\s+', '', c.get('path', '')).lower()]
+                if filtered:
+                    candidates = filtered
+                else:
+                    print(f"    搭配学习页：没有 section 为「{section_filter}」的 Learning，改用全部候选")
+
+            if not candidates:
+                print("    搭配学习页：本单元没有 Collocation / Learning，跳过")
+                return False
+            print(f"    搭配学习页：本单元有 {len(candidates)} 个候选 Learning，按内容匹配挑一个")
+
+            reference = self._context_reference_tokens()
+            best_text, best_score, best_path = "", -1.0, ""
+            for order, cand in enumerate(candidates[:3]):
+                if order > 0 and not open_unit():
+                    break
+                clicked = self.driver.execute_script("""
+                    const index = arguments[0];
+                    const all = [...document.querySelectorAll('[class*="taskItemInnerLayout"]')];
+                    const el = all[index];
+                    if (!el) return false;
+                    const nameEl = el.querySelector('[class*="taskTypeName"]');
+                    let target = nameEl || el;
+                    for (let i = 0; i < 3 && target; i++) { target.click(); target = target.parentElement; }
+                    return true;
+                """, cand['index'])
+                if not clicked:
+                    continue
+                time.sleep(11)
+                text = self.driver.execute_script("""
+                    const clean = t => (t || '').replace(/\\s+/g, ' ').trim();
+                    let text = clean(document.body.innerText);
+                    const cut = text.indexOf('目录笔记');
+                    if (cut > 200) text = text.slice(0, cut);
+                    return text.slice(0, 7000);
+                """) or ""
+                if len(text) < 120:
+                    continue
+                score = self._text_overlap(reference, text)
+                print(f"      候选 {cand['path']} → 重合度 {score:.2f}（{len(text)} 字符）")
+                if score > best_score:
+                    best_text, best_score, best_path = text, score, cand['path']
+                if score >= 0.35:
+                    break
+
+            if not best_text:
+                print("    搭配学习页：没抓到有效正文，跳过")
+                return False
+
+            self.ai_client.add_passage_if_new(best_text)
+            print(f"    搭配学习页：采用 {best_path}（重合度 {best_score:.2f}，{len(best_text)} 字符）")
+            self._loaded_reading_units.add(cache_key)
+            return True
+        except Exception as exc:
+            print(f"    搭配学习页读取失败（不影响作答）: {str(exc)[:80]}")
+            return False
+        finally:
+            try:
+                if original:
+                    self.driver.close()
+                    self.driver.switch_to.window(original)
+            except Exception:
+                pass
+
+    def _context_reference_tokens(self) -> set:
+        """当前页面的词集合，用来判断哪一份 Learning 属于这道题。"""
+        text = getattr(self, '_context_reference_text', "") or ""
+        if not text:
+            try:
+                text = self.driver.find_element(By.TAG_NAME, 'body').text or ""
+            except Exception:
+                text = ""
+        return {w for w in re.findall(r"[A-Za-z]{5,}", text.lower())}
+
+    @staticmethod
+    def _text_overlap(reference: set, text: str) -> float:
+        if not reference:
+            return 0.0
+        tokens = {w for w in re.findall(r"[A-Za-z]{5,}", (text or '').lower())}
+        if not tokens:
+            return 0.0
+        return len(reference & tokens) / max(1, len(reference))
+
+    # ---- Vocabulary 复用与录音题稿件 -------------------------------------
+    def _vocab(self) -> VocabularyStore:
+        """拿词汇缓存（测试或半初始化的 solver 上也能安全用）。"""
+        store = getattr(self, 'vocab_store', None)
+        if store is None:
+            store = VocabularyStore()
+            self.vocab_store = store
+        return store
+
+    def _tts(self) -> TTSEngine:
+        engine = getattr(self, 'tts_engine', None)
+        if engine is None:
+            engine = TTSEngine()
+            self.tts_engine = engine
+        return engine
+
+    def _needs_vocabulary(self, questions: List[Question]) -> bool:
+        """这些题要不要 Vocabulary 对照表（中文括注填空 / 无原声口语稿）。"""
+        for q in questions or []:
+            if getattr(q, 'needs_speech_script', False):
+                return True
+            if getattr(q, 'q_type', None) in (QuestionType.FILL_IN, QuestionType.BANKED_CLOZE,
+                                              QuestionType.TEXT) and blank_cjk_hints(q):
+                return True
+        return False
+
+    def _harvest_from_vocabulary_tab(self) -> Optional[bool]:
+        """当前在 Exercise 子标签时，先切到同任务的 Vocabulary 抓一遍对照再回来。
+
+        子步骤本来就是二级 Tab（`.pc-header-tasks-row > .pc-task`），批量处理时会
+        依次走到；但「快速处理当前页」只停在一个 Tab 上，这时对照表还是空的，答案就
+        只能靠模型猜。抓一次 Vocabulary 再切回来，Exercise 1 的填空能逐字对上。
+        """
+        if self._should_stop():
+            return False
+        try:
+            tabs = self._get_level2_tabs()
+        except Exception:
+            return False
+        if len(tabs) < 2:
+            return False
+
+        def title_of(tab: Dict) -> str:
+            return str(tab.get('title') or '').strip().lower()
+
+        vocab_tab = next((tab for tab in tabs if title_of(tab) == 'vocabulary'), None)
+        if vocab_tab is None:
+            return False
+        current = next((tab for tab in tabs if tab.get('is_active')), None)
+        if current is None or title_of(current) == 'vocabulary':
+            return False
+
+        print("    缓存里没有 Vocabulary 对照表，先切过去抓一遍...")
+        if not WebDriverHelper.safe_click(self.driver, vocab_tab['element']):
+            print("    切换 Vocabulary 失败，继续用模型作答")
+            return False
+        if self.stop_requested.wait(2.5):
+            return None
+        self._harvest_vocabulary()
+        if not WebDriverHelper.safe_click(self.driver, current['element']):
+            print("    切回原标签失败，请留意页面是否停在 Vocabulary")
+            return None
+        if self.stop_requested.wait(2.0):
+            return None
+        return True
+
+    def _harvest_vocabulary(self) -> int:
+        """把当前页 Vocabulary 里的中英对照收进缓存（跨页、跨任务都保留）。"""
+        if self._should_stop():
+            return 0
+        try:
+            rows = self.driver.execute_script(VOCAB_PAIRS_JS) or []
+        except Exception as exc:
+            logger.debug(f"读取词汇对照失败: {str(exc)[:80]}")
+            return 0
+        if not isinstance(rows, (list, tuple)):
+            return 0
+        added = self._vocab().add_rows(rows)
+        if added:
+            print(f"    词汇表更新 {added} 条（累计 {len(self._vocab())} 条）")
+        return added
+
+    def _speaking_script_for(self, q: Question, directions: str = "") -> str:
+        """主观录音题：让模型写一段可直接朗读的英文口语稿。"""
+        if self._should_stop():
+            return ""
+        images = q.element.find_elements(
+            By.XPATH,
+            "ancestor::div[contains(@class,'p-oral-personal-state')][1]"
+            "//div[contains(@class,'oral-personal-state-sentence-container')]//img")
+        screenshot = None
+        if images:
+            if not self.config.screenshot:
+                print("    口语题需要识别图片，请在配置中启用截图并使用支持图片的模型")
+                return ""
+            try:
+                screenshot = images[0].screenshot_as_png
+            except Exception:
+                print("    口语题图片截图失败，停止作答")
+                return ""
+            if not screenshot:
+                print("    口语题图片截图为空，停止作答")
+                return ""
+        prompt = self.prompt_builder.build_speaking_script(
+            q, directions, target_seconds=self.executor.RECORD_MAX_SECONDS * 0.85)
+        response = self.ai_client.ask(prompt, stop_requested=self.stop_requested,
+                                      screenshot=screenshot, require_image=bool(images))
+        if not response or self._should_stop():
+            print(f"    题目 {q.number}: 没有拿到口语稿")
+            return ""
+        script = self._clean_speech_script(response)
+        if not script:
+            print(f"    题目 {q.number}: 口语稿清洗后为空")
+        else:
+            print(f"    题目 {q.number}: 口语稿 {len(script.split())} 词")
+        return script
+
+    @staticmethod
+    def _clean_speech_script(text: str) -> str:
+        value = (text or '').strip()
+        value = re.sub(r'^```[a-zA-Z]*\s*|\s*```$', '', value).strip()
+        value = re.sub(r'^(口语稿|参考答案|Answer|Script)\s*[:：]\s*', '', value, flags=re.I)
+        value = re.sub(r'[*_`#>]+', ' ', value)
+        return re.sub(r'\s+', ' ', value).strip()
+
+    def _repair_questions(self, questions: List[Question], directions: str = "") -> int:
+        """上一轮没填好的题，带着更严格的格式要求再答一次。"""
+        if not questions or self._should_stop():
+            return 0
+        prompt = self.prompt_builder.build(questions, directions)
+        prompt += ("\n\n【修正要求】上一轮这些题没有填好：答案格式不符合题型或没有写进输入框。"
+                   "请严格按题型作答——选项/匹配题只输出字母（如 1.B），填空题每空一个答案，"
+                   "文本题给完整段落，不要解释、不要重复题号之外的文字。")
+        response = self.ai_client.ask(prompt, stop_requested=self.stop_requested)
+        if not response or self._should_stop():
+            return 0
+
+        repaired = 0
+        for q in questions:
+            if self._should_stop():
+                break
+            if q.q_type in [QuestionType.SINGLE_CHOICE, QuestionType.LISTENING_CHOICE,
+                            QuestionType.VIDEO_CHOICE, QuestionType.MULTIPLE_CHOICE,
+                            QuestionType.MATCHING, QuestionType.VOCABULARY_TEST]:
+                ans = self._extract_single_answer(response, q.number)
+                if not ans:
+                    ans = response
+            elif q.q_type == QuestionType.SORTING and len(questions) > 1:
+                ans = self._extract_single_answer(response, q.number)
+            else:
+                ans = response
+            try:
+                if ans and self.executor.execute(q, ans):
+                    repaired += 1
+            except Exception as exc:
+                print(f"    修正题目 {q.number} 失败: {str(exc)[:60]}")
+        return repaired
 
     def _process_tab_with_accumulation(self, tab_name: str, l1_idx: int, l2_idx: int) -> bool:
         """处理Tab - 累积原文模式，包含视频/音频预处理"""
@@ -5492,10 +10628,37 @@ class AISolver:
             return self._process_current_tab_content(
                 self.ai_client.current_chapter_id or "unknown", tab_name, l1_idx, l2_idx
             )
-        self._preprocess_video_if_needed(tab_name, l1_idx, l2_idx)
+        skip_asr = self._skip_transcription(tab_name)
+        prefetch_holder = {}
+        prefetch_signature = ""
+        on_transcript = None
+        prepared = self._prepare_media_prefetch(skip_asr)
+        if prepared:
+            all_questions, candidates, directions, prefetch_signature = prepared
+        def on_transcript(transcript):
+            nonlocal prepared, candidates, directions, prefetch_signature
+            if not transcript or self._should_stop():
+                return
+            if not prepared:
+                # 有些页面播放前题目未挂载，转写完成后、播放前再解析一次。
+                prepared = self._prepare_media_prefetch(False)
+                if not prepared:
+                    return
+                _all, candidates, directions, prefetch_signature = prepared
+            prefetch_holder['answer'] = self._start_answer_prefetch(candidates, directions)
+        if prepared:
+            self._preprocess_video_if_needed(
+                tab_name, l1_idx, l2_idx, skip_transcription=skip_asr,
+                on_transcript=on_transcript)
+        else:
+            self._preprocess_video_if_needed(tab_name, l1_idx, l2_idx,
+                                             skip_transcription=skip_asr,
+                                             on_transcript=on_transcript)
         if self._should_stop():
             return False
-        self._preprocess_audio_if_needed(tab_name, l1_idx, l2_idx)
+        self._preprocess_audio_if_needed(tab_name, l1_idx, l2_idx,
+                                         skip_transcription=skip_asr,
+                                         on_transcript=on_transcript)
         if self._should_stop():
             return False
 
@@ -5506,10 +10669,120 @@ class AISolver:
             self.ai_client.add_passage_if_new(current_passage)
 
         return self._process_current_tab_content(
-            self.ai_client.current_chapter_id or "unknown", tab_name, l1_idx, l2_idx
+            self.ai_client.current_chapter_id or "unknown", tab_name, l1_idx, l2_idx,
+            prefetch=prefetch_holder.get('answer'),
+            prefetch_signature=prefetch_signature,
         )
 
-    def _process_current_tab_content(self, chapter_name: str, tab_name: str, l1_idx: int, l2_idx: int) -> bool:
+    def _prepare_media_prefetch(self, skip_asr: bool = False):
+        """视频页先解析题目，等转写完成就在后台问 AI，与播放并行。"""
+        # 即使页面被判定为“无需作答”，视频播完后也可能出现题目；
+        # 先照常尝试解析，解析不到再在转写完成回调里重试一次。
+        if not (self._has_video_on_page() or self._has_audio_on_page()):
+            return None
+        try:
+            questions, directions = self.parser.parse_all()
+        except Exception as exc:
+            print(f"    预取解析题目失败: {str(exc)[:60]}")
+            return None
+        excluded = {
+            QuestionType.VIDEO, QuestionType.AUDIO,
+            QuestionType.VOCABULARY_FLASHCARD, QuestionType.SELF_CHECK,
+            QuestionType.DISCUSSION_BOARD, QuestionType.RECORD,
+            QuestionType.ORAL_ALOUD, QuestionType.MY_VOICE_TEXT,
+        }
+        if any(q.q_type in (QuestionType.RECORD, QuestionType.ORAL_ALOUD,
+                            QuestionType.MY_VOICE_TEXT) for q in questions):
+            return None
+        candidates = [q for q in questions if q.q_type not in excluded]
+        if not candidates:
+            return None
+        large_fill = any(
+            q.q_type in (QuestionType.FILL_IN, QuestionType.BANKED_CLOZE)
+            and len(q.inputs) > 8 and not is_expression_bank_question(q)
+            for q in candidates)
+        if large_fill:
+            return None
+        signature = self._generate_questions_signature(questions)
+        return questions, candidates, directions, signature
+
+    def _start_answer_prefetch(self, questions, directions) -> Optional[AnswerPrefetch]:
+        prompt = self.prompt_builder.build(questions, directions)
+        if not prompt:
+            return None
+        shot = self._question_screenshot(questions)
+        print(f"    后台预取答案（{len(questions)} 题，与视频播放并行）...")
+        return AnswerPrefetch(self.ai_client, prompt, shot, self.stop_requested)
+
+    def _material_corpus(self) -> str:
+        parts = []
+        for msg in getattr(self.ai_client, 'material_messages', []) or []:
+            text = msg.get('content', '') if isinstance(msg, dict) else ''
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        value = (text or '').lower().replace('’', "'").replace('‘', "'")
+        value = re.sub(r'[^a-z0-9%$.\s-]', ' ', value)
+        return re.sub(r'\s+', ' ', value).strip()
+
+    def _reorder_sorting_by_transcript(self, q: Question, order: List[str]) -> List[str]:
+        if not order:
+            return order
+        corpus = self._normalize_for_match(self._material_corpus())
+        if not corpus:
+            return order
+        positions = {}
+        for letter in order:
+            opt = next((o for o in q.options if o.letter == letter), None)
+            text = self._normalize_for_match(opt.text if opt else '')
+            if not text:
+                return order
+            pos = corpus.find(text)
+            if pos < 0 and len(text.split()) > 8:
+                pos = corpus.find(' '.join(text.split()[:8]))
+            if pos >= 0:
+                positions[letter] = pos
+        if len(positions) != len(order):
+            positions = self._keyword_positions(corpus, q, order)
+        if len(positions) != len(order) or len(set(positions.values())) != len(positions):
+            return order
+        corrected = sorted(order, key=lambda letter: positions[letter])
+        if corrected != order:
+            print(f"    按原文顺序校正排序: {order} -> {corrected}")
+        return corrected
+
+    def _keyword_positions(self, corpus: str, q: Question, order: List[str]) -> Dict[str, int]:
+        """选项常是转写的改写，用实词重合度找最可能的原文句。"""
+        sentences = [s for s in re.split(r'(?<=[.!?])\s+', corpus) if s.strip()]
+        if not sentences:
+            return {}
+        stop = {'the', 'and', 'that', 'with', 'from', 'this', 'have', 'were', 'their',
+                'they', 'into', 'such', 'when', 'what', 'which', 'been', 'also', 'more',
+                'some', 'many', 'other', 'after', 'before', 'over', 'than', 'them'}
+        result = {}
+        for letter in order:
+            opt = next((o for o in q.options if o.letter == letter), None)
+            words = {w for w in self._normalize_for_match(opt.text if opt else '').split()
+                     if len(w) > 2 and w not in stop}
+            if len(words) < 2:
+                return {}
+            best_idx, best_score = -1, 0.0
+            for idx, sentence in enumerate(sentences):
+                overlap = len(words & set(sentence.split()))
+                score = overlap / len(words)
+                if score > best_score:
+                    best_idx, best_score = idx, score
+            if best_idx < 0 or best_score < 0.34:
+                return {}
+            result[letter] = best_idx
+        return result
+
+    def _process_current_tab_content(self, chapter_name: str, tab_name: str, l1_idx: int, l2_idx: int,
+                                     prefetch: Optional[AnswerPrefetch] = None,
+                                     prefetch_signature: str = "") -> bool:
         if self._should_stop():
             return False
         direction_part = self._generate_content_hash_from_direction()
@@ -5521,13 +10794,16 @@ class AISolver:
         print(f"    内容标识: {hashlib.md5(content_hash.encode()).hexdigest()[:16]}...")
 
         if content_hash in self.processed_hashes:
-            print(f"   ⏭ 已处理过，跳过")
+            print(f"   【跳过】已处理过，跳过")
             return False
 
         self.processed_hashes.add(content_hash)
 
         if self._is_publish_page():
-            return self._process_publish_content(tab_name)
+            success = self._process_publish_content(tab_name)
+            if not success:
+                self.processed_hashes.discard(content_hash)
+            return success
 
         page_num = 1
         total_answered = 0
@@ -5538,15 +10814,34 @@ class AISolver:
                 print("    已请求停止，当前任务提前结束")
                 return False
 
-            self._preprocess_video_if_needed(tab_name, l1_idx, l2_idx)
+            skip_asr = self._skip_transcription(tab_name)
+            self._preprocess_video_if_needed(tab_name, l1_idx, l2_idx,
+                                             skip_transcription=skip_asr)
             if self._should_stop():
                 return False
-            self._preprocess_audio_if_needed(tab_name, l1_idx, l2_idx)
+            self._preprocess_audio_if_needed(tab_name, l1_idx, l2_idx,
+                                             skip_transcription=skip_asr)
             if self._should_stop():
                 return False
             questions, directions = self.parser.parse_all()
             if self._should_stop():
                 return False
+            # 先把 Vocabulary 的中英对照收进缓存，Exercise 1 填空题直接复用
+            self._harvest_vocabulary()
+            # 当前 Tab 是 Exercise、缓存还是空的（快速处理当前页时很常见）：
+            # 借同任务的 Vocabulary 子标签抓一遍再切回来，答案就能逐字对上
+            if page_num == 1 and not len(self._vocab()) and self._needs_vocabulary(questions):
+                switched = self._harvest_from_vocabulary_tab()
+                if switched is None:
+                    return False
+                if switched:
+                    questions, directions = self.parser.parse_all()
+                    if self._should_stop():
+                        return False
+                    if prefetch is not None:
+                        print("    词汇页切换后，放弃预取答案")
+                        prefetch = None
+            self._last_question_types = {q.q_type for q in questions}
             print(f"\n    处理第 {page_num} 页题目...")
             print(f"    找到 {len(questions)} 个可见题目")
 
@@ -5568,7 +10863,13 @@ class AISolver:
                         return False
                     if handler.can_handle(q):
                         print(f"     使用 {handler.__class__.__name__} 处理")
-                        handler.handle(q)
+                        handled = handler.handle(q)
+                        if q.q_type == QuestionType.AUDIO:
+                            if not handled or self._should_stop():
+                                self.processed_hashes.discard(content_hash)
+                                return False
+                            special_handled = True
+                            break
                         if self._should_stop():
                             return False
                         special_handled = True
@@ -5577,25 +10878,99 @@ class AISolver:
                         if q.q_type in [QuestionType.VOCABULARY_FLASHCARD, QuestionType.VIDEO]:
                             print(f"    特殊内容处理完成")
                             return True
+                        if q.q_type == QuestionType.DISCUSSION_BOARD:
+                            print(f"    讨论区已处理")
+                            return True
                         break
 
             normal_questions = [q for q in questions if q.q_type not in [
                 QuestionType.VOCABULARY_FLASHCARD,
                 QuestionType.VIDEO,
+                QuestionType.AUDIO,
                 QuestionType.SELF_CHECK,
                 QuestionType.DISCUSSION_BOARD
             ]]
 
-            if normal_questions:
-                print(f"    共 {len(normal_questions)} 道题目需要回答")
-                prompt = self.prompt_builder.build(normal_questions, directions)
-                if self._should_stop():
+            total_questions = len(normal_questions)
+
+            # 录音题：有参考音频就用，没有就用 TTS 朗读页面原文。
+            # total_questions 保持原值（含录音题），否则「只有录音题」的页面不会触发提交。
+            record_questions = [q for q in normal_questions
+                                if q.q_type in (QuestionType.RECORD, QuestionType.ORAL_ALOUD)]
+            record_answered = 0
+            if record_questions:
+                print(f"    本页 {len(record_questions)} 道录音题，开始逐条录音...")
+                for q in record_questions:
+                    if self._should_stop():
+                        return False
+                    needs_tts = q.needs_speech_script or q.q_type == QuestionType.ORAL_ALOUD
+                    if needs_tts and not self._tts().enabled:
+                        print("    录音题没有原声，TTS 已关闭，跳过该题")
+                        continue
+                    script = ""
+                    if q.q_type == QuestionType.RECORD and q.needs_speech_script:
+                        # 页面既没有样音也没有原文（自由口语题），只能让模型写一段
+                        script = self._speaking_script_for(q, directions)
+                        if not script:
+                            continue
+                    if self.executor.execute(q, script):
+                        record_answered += 1
+                print(f"    录音题完成 {record_answered}/{len(record_questions)}")
+                if record_answered < len(record_questions):
+                    print("    录音题未完成，停止当前页")
                     return False
-                ai_response = self.ai_client.ask(prompt, stop_requested=self.stop_requested)
+                normal_questions = [q for q in normal_questions
+                                    if q.q_type not in (QuestionType.RECORD,
+                                                        QuestionType.ORAL_ALOUD)]
+                if not normal_questions:
+                    total_answered += record_answered
+                    print(f"    本页成功填写 {record_answered}/{total_questions} 题")
+
+            if normal_questions:
+                print(f"    共 {total_questions} 道题目需要回答")
+                success_count = record_answered
+
+                # 空位特别多的填空题（如 28 空的首字母搭配）一次性问模型时，
+                # 推理型模型容易把 token 全烧在思考上导致返回空；拆成小块逐段问更稳。
+                # 短语变形填空要求「每个表达只用一次」，必须一次性看到全部空位做
+                # 全局分配；拆批会让后一批重复选用已用过的表达。
+                large_fills = [q for q in normal_questions
+                               if q.q_type in (QuestionType.FILL_IN, QuestionType.BANKED_CLOZE)
+                               and len(q.inputs) > 8
+                               and not is_expression_bank_question(q)]
+                for q in large_fills:
+                    if self._should_stop():
+                        return False
+                    if self._answer_chunked_fill(q, directions):
+                        success_count += 1
+                normal_questions = [q for q in normal_questions if q not in large_fills]
+
+                ai_response = None
+                used_prefetch = (prefetch is not None and page_num == 1
+                                 and current_signature == prefetch_signature
+                                 and not self._retry_hint
+                                 and prefetch.materials == tuple(
+                                     (m['role'], m['content']) for m in self.ai_client.material_messages))
+                if used_prefetch:
+                    print(f"    等待播放期间的 AI 预取答案（已运行 {prefetch.elapsed:.1f}s）...")
+                    ai_response = prefetch.wait(timeout=180)
+                    if ai_response:
+                        print(f"    预取答案已就绪（总耗时 {prefetch.elapsed:.1f}s）")
+                    else:
+                        print("    预取未返回，改为同步请求")
+                if not ai_response:
+                    prompt = self.prompt_builder.build(normal_questions, directions) if normal_questions else ""
+                    if prompt and self._retry_hint:
+                        prompt += "\n\n【平台答案解析】\n" + self._retry_hint[:2000]
+                    if self._should_stop():
+                        return False
+                    shot = self._question_screenshot(normal_questions)
+                    ai_response = self.ai_client.ask(prompt, stop_requested=self.stop_requested,
+                                                     screenshot=shot) if normal_questions else None
                 if self._should_stop():
                     return False
                 if ai_response:
-                    success_count = 0
+                    failed_questions = []
 
                     for q in normal_questions:
                         if self._should_stop():
@@ -5607,23 +10982,45 @@ class AISolver:
                         elif q.q_type in [QuestionType.BANKED_CLOZE, QuestionType.FILL_IN,
                                           QuestionType.DROPDOWN_SELECT]:
                             ans = ai_response
+                        elif q.q_type == QuestionType.SORTING and len(normal_questions) > 1:
+                            ans = self._extract_single_answer(ai_response, q.number)
                         else:
                             ans = ai_response
 
                         if ans:
+                            if q.q_type == QuestionType.SORTING:
+                                letters = [opt.letter for opt in q.options]
+                                order = self.executor._parse_sorting_order(ans, letters)
+                                corrected = self._reorder_sorting_by_transcript(q, order)
+                                if corrected and corrected != order:
+                                    ans = ' '.join(corrected)
                             if self.executor.execute(q, ans):
                                 success_count += 1
+                            else:
+                                failed_questions.append(q)
                         else:
                             print(f"    题目 {q.number} 无答案")
+                            failed_questions.append(q)
+
+                    if failed_questions:
+                        repaired = self._repair_questions(failed_questions, directions)
+                        success_count += repaired
+                        print(f"    二次修正成功 {repaired}/{len(failed_questions)} 题")
 
                     total_answered += success_count
-                    print(f"    本页成功填写 {success_count}/{len(normal_questions)} 题")
-                    if success_count != len(normal_questions):
+                    print(f"    本页成功填写 {success_count}/{total_questions} 题")
+                    if success_count != total_questions:
                         print("    本页未完整填写，停止当前任务，请检查答案和选项状态")
                         return False
-                else:
+                elif normal_questions:
                     print("    AI 未返回答案，停止当前任务")
                     return False
+                else:
+                    total_answered += success_count
+                    print(f"    本页成功填写 {success_count}/{total_questions} 题")
+                    if success_count != total_questions:
+                        print("    本页未完整填写，停止当前任务，请检查答案和选项状态")
+                        return False
 
             if self._should_stop():
                 return False
@@ -5643,7 +11040,9 @@ class AISolver:
                     print(f"    点击下一题失败")
                     break
 
-                if not self._wait_for_content_change(pre_click_signature, timeout=5):
+                # 翻页后等 30 秒：录音刚结束时平台还在上传/评分，页面不会立刻切，
+                # 5 秒窗口太短（parse_all 一次约 0.7s，只够 7 次）。
+                if not self._wait_for_content_change(pre_click_signature, timeout=30):
                     if self._should_stop():
                         return False
                     print(f"    内容未变化，可能已到最后一页")
@@ -5658,11 +11057,16 @@ class AISolver:
 
             if self._should_stop():
                 return False
-            if normal_questions and self.executor.submit():
+            # 注意：分批作答时 normal_questions 会被清空，是否提交要看 total_questions，
+            # 否则「做完不交卷」，用户还得手动点提交。
+            if total_questions and self.executor.submit():
                 self._wait_for_submit_complete()
                 if self._should_stop():
                     return False
                 self._handle_confirm_dialog()
+                print(f"    已自动提交")
+            elif total_questions:
+                print(f"    没找到可点击的提交按钮，请手动提交")
             print(f"    没有更多题目了")
             break
         print(f"    总共回答 {total_answered} 题")
@@ -5684,6 +11088,16 @@ class AISolver:
         print("    检测到新版 ipublish 播放器（course-v3），启用专用适配流程")
         self.publish_executor.dismiss_rules_popup()
         if not self._publish_prepare_scope(task_name):
+            return False
+
+        quiz_result = self._publish_process_quiz()
+        if quiz_result is not None:
+            return quiz_result
+        videos = self._publish_play_task_media()
+        if videos is None:
+            return False
+        reading = self._publish_read_task()
+        if reading is None:
             return False
 
         handled = 0
@@ -5724,10 +11138,214 @@ class AISolver:
         if skipped:
             print(f"    另有 {skipped} 个题目组题型暂不支持或未渲染，已跳过")
         if not handled and not skipped and not rejected:
-            print("    当前任务没有待自动作答的题目组（已完成或需人工处理），不进入其他任务")
-        return not self._should_stop()
+            if not videos and not reading:
+                print("    当前任务没有可处理的题目或视频，请检查课程目录中的实际进度")
+                return False
+            print("    本任务正文已浏览，请以课程目录显示的进度为准")
+        return not self._should_stop() and not skipped and not rejected
 
-    def _publish_prepare_scope(self, task_name: str = '', timeout: float = 8.0) -> bool:
+    def _publish_read_task(self):
+        """浏览任务正文中的阅读内容，以触发平台记录阅读进度。"""
+        with PublishFrameContext(self.driver) as context:
+            if not context.entered:
+                return None
+            nodes = self.driver.find_elements(
+                By.CSS_SELECTOR, '.editor-content > [data-lexical-node-type="base-paragraph"], '
+                                 '.editor-content > [data-lexical-node-type="highlight-block"]')
+            scoped = self._publish_scoped_groups([{'element': node} for node in nodes])
+            count = 0
+            for state in scoped:
+                node = state['element']
+                if not (node.get_attribute('textContent') or '').strip():
+                    continue
+                if self.driver.execute_script('return !!arguments[0].closest("[data-ipublish-question-group-type]")', node):
+                    continue
+                self.driver.execute_script('arguments[0].scrollIntoView({block:"center"});', node)
+                if self.stop_requested.wait(3):
+                    return None
+                count += 1
+            return count
+
+    def _publish_play_task_media(self):
+        """播放独立音视频和已提交题组中的材料。"""
+        with PublishFrameContext(self.driver) as context:
+            if not context.entered:
+                return None
+            wrappers = self.driver.find_elements(By.CSS_SELECTOR,
+                '[data-lexical-node-type="insert-video"], [data-lexical-node-type="insert-audio"]')
+            scoped = self._publish_scoped_groups([{'element': wrapper} for wrapper in wrappers])
+            played = 0
+            for state in scoped:
+                wrapper = state['element']
+                if self.driver.execute_script('return !!arguments[0].closest("[data-ipublish-question-group-type]")', wrapper):
+                    group = self.driver.execute_script('return arguments[0].closest("[data-ipublish-question-group-type]")', wrapper)
+                    if not self.publish_parser.group_submitted(group):
+                        continue
+                video = None
+                try:
+                    self.driver.execute_script('arguments[0].scrollIntoView({block:"center"});', wrapper)
+                    tag = 'audio' if wrapper.get_attribute('data-lexical-node-type') == 'insert-audio' else 'video'
+                    video = WebDriverWait(self.driver, 15).until(
+                        lambda d: wrapper.find_elements(By.TAG_NAME, tag) or False)[0]
+                    self.driver.execute_script('arguments[0].muted=true; arguments[0].playbackRate=2; arguments[0].play();', video)
+                    duration = WebDriverWait(self.driver, 15).until(
+                        lambda d: d.execute_script('return Number.isFinite(arguments[0].duration) && arguments[0].duration || 0', video))
+                    print(f'    播放当前任务音视频（{int(duration)} 秒）')
+                    deadline = time.monotonic() + duration + 60
+                    while not self._should_stop() and time.monotonic() < deadline:
+                        progress = self.driver.execute_script(
+                            'return {ended:arguments[0].ended, error:!!arguments[0].error}', video)
+                        if progress['ended']:
+                            break
+                        if progress['error'] or self.stop_requested.wait(0.5):
+                            return None
+                    else:
+                        print('    视频未播放完成')
+                        return None
+                    played += 1
+                except Exception as exc:
+                    print(f'    视频播放失败: {str(exc)[:100]}')
+                    return None
+                finally:
+                    try:
+                        if video is not None:
+                            self.driver.execute_script('arguments[0].pause()', video)
+                    except Exception:
+                        pass
+        return None if self._should_stop() else played
+
+    def _publish_process_quiz(self):
+        """处理当前任务中的独立诊断测试，已有成绩和未完成答卷不重做。"""
+        with PublishFrameContext(self.driver) as context:
+            if not context.entered:
+                return False
+            links = self.driver.find_elements(By.CSS_SELECTOR, '[data-lexical-node-type="quiz-paper-link"]')
+            scoped = self._publish_scoped_groups([{'element': link} for link in links])
+            if not scoped:
+                return None
+            if len(scoped) != 1:
+                print('    当前任务包含多个测试，请手动处理')
+                return False
+            covers = scoped[0]['element'].find_elements(By.CSS_SELECTOR, '[class*="coverContainer"]')
+            if not covers or not WebDriverHelper.safe_click(self.driver, covers[0]):
+                print('    无法打开单元测试')
+                return False
+            try:
+                WebDriverWait(self.driver, 15).until(lambda d: d.find_elements(By.CSS_SELECTOR, '[class*="acknowledge_btn__"]') or d.find_elements(By.CSS_SELECTOR, 'iframe[src*="/learner/testing/"]'))
+                start = self.driver.find_elements(By.CSS_SELECTOR, '[class*="acknowledge_btn__"]')
+                if start and not WebDriverHelper.safe_click(self.driver, start[0]):
+                    return False
+                frame = WebDriverWait(self.driver, 15).until(EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, 'iframe[src*="/learner/testing/"]')))
+                self.driver.switch_to.frame(frame)
+                WebDriverWait(self.driver, 20).until(lambda d: d.find_elements(By.CSS_SELECTOR, '[data-ipublish-question-group-type]'))
+                text = self.driver.find_element(By.TAG_NAME, 'body').text
+                if '最终得分' in text or '再次作答' in text:
+                    print('    单元测试已有成绩，保留现有结果')
+                    return True
+                groups = self.publish_parser.collect_groups()
+                parsed = []
+                for state in groups:
+                    if state['kind'] != 'choice':
+                        print(f"    单元测试暂不支持题型: {state['type']}")
+                        return False
+                    questions = self.publish_parser.parse_group(state['element'], state['type'], 1)
+                    if not questions or any(opt.is_selected for q in questions for opt in q.options):
+                        print('    测试已有作答或题目解析失败，保留当前进度')
+                        return False
+                    parsed.append((state, questions))
+                if not parsed:
+                    return False
+                for state, questions in parsed:
+                    self.ai_client.force_reset('单元测试题组')
+                    if not self._publish_prepare_media(state['element']):
+                        return False
+                    prompt = self.prompt_builder.build(questions, self.publish_parser.group_direction(state['element']))
+                    response = self.ai_client.ask(prompt, stop_requested=self.stop_requested)
+                    if not response or self._should_stop():
+                        return False
+                    for question in questions:
+                        answer = self._publish_answer_text(question, response, 0)
+                        if not answer or not self.publish_executor.execute(question, answer):
+                            print('    测试未完整填写，保留当前进度')
+                            return False
+                text = self.driver.find_element(By.TAG_NAME, 'body').text
+                progress = re.search(r'答题卡共计\s*(\d+)\s*题\s*(\d+)\s*/\s*(\d+)', text)
+                if not progress or int(progress.group(1)) == 0 or len(set(progress.groups())) != 1:
+                    print('    无法确认测试全部答完，不提交')
+                    return False
+                submit = self.driver.find_elements(By.XPATH, "//span[normalize-space(.)='提交']")
+                if not submit or not WebDriverHelper.safe_click(self.driver, submit[-1]):
+                    return False
+                self.driver.switch_to.parent_frame()
+                confirm = WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(
+                    (By.XPATH, "//button[normalize-space(.)='确 定' or normalize-space(.)='确定']")))
+                if not WebDriverHelper.safe_click(self.driver, confirm):
+                    return False
+                self.driver.switch_to.frame(frame)
+                WebDriverWait(self.driver, 30).until(lambda d: '最终得分' in d.find_element(By.TAG_NAME, 'body').text)
+                print('    单元测试已提交并生成成绩')
+                return True
+            except Exception as exc:
+                print(f'    单元测试处理失败: {str(exc)[:100]}')
+                return False
+
+    def _publish_scope_has_questions(self, groups) -> bool:
+        """范围内是否已有可解析的题目。"""
+        for group in groups or []:
+            if group.get('kind') in ('skip', 'unknown'):
+                continue
+            try:
+                if self.publish_parser.parse_group(group['element'], group['type']):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _publish_open_entry_card(self) -> bool:
+        """教材卡片模式：点开可见的「答题」，并锁定新渲染出的题组。"""
+        self._publish_card_anchor = ''
+        try:
+            with PublishFrameContext(self.driver) as context:
+                if not context.entered:
+                    return False
+                clicked = self.driver.execute_script("""
+                    const btns = [...document.querySelectorAll('[class*="normal-card_btn__"]')]
+                        .filter(b => {
+                            const r = b.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0 &&
+                                   r.top > -40 && r.top < innerHeight;
+                        });
+                    if (!btns.length) return false;
+                    btns[0].click();
+                    return true;
+                """)
+                if not clicked:
+                    return False
+                print("    检测到「答题」卡片，已自动点开")
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    time.sleep(0.5)
+                    found = self.driver.execute_script("""
+                        const groups = [...document.querySelectorAll(
+                            '[data-ipublish-question-group-type]')];
+                        let best = null;
+                        groups.forEach(g => {
+                            const n = g.querySelectorAll('[data-question-id]').length;
+                            if (n > 0 && (!best || n > best.n)) {
+                                best = {id: g.id || g.dataset.lexicalNodeAnchor || '', n};
+                            }
+                        });
+                        return best;
+                    """)
+                    if found and found.get('id'):
+                        self._publish_card_anchor = found['id']
+                        return True
+        except Exception as exc:
+            print(f"    打开答题卡片失败：{str(exc)[:80]}")
+        return False
+
+    def _publish_prepare_scope(self, task_name: str = '', timeout: float = 30.0) -> bool:
         self._publish_scope = None
         deadline = time.monotonic() + timeout
         reason = '未能进入任务内容'
@@ -5741,7 +11359,58 @@ class AISolver:
                 with PublishFrameContext(self.driver) as context:
                     if not context.entered:
                         raise ValueError('未能进入内容 iframe')
-                    scope = PublishTaskScope.capture(self.driver, anchor)
+                    if task_name.startswith('quick_current_page_'):
+                        scope = None
+                        selected = []
+                        try:
+                            scope = PublishTaskScope.capture_visible(self.driver)
+                        except Exception:
+                            scope = None
+                        if scope is not None:
+                            try:
+                                with PublishFrameContext(self.driver):
+                                    selected = scope.select(
+                                        self.driver, self.publish_parser.collect_groups())
+                            except Exception:
+                                selected = []
+                        if not selected or not self._publish_scope_has_questions(selected):
+                            if self._publish_open_entry_card() and self._publish_card_anchor:
+                                try:
+                                    with PublishFrameContext(self.driver):
+                                        url = self.driver.execute_script(
+                                            'return location.href.split("#")[0]')
+                                    card_scope = PublishTaskScope(
+                                        document_url=url,
+                                        start_anchor=self._publish_card_anchor,
+                                        block_only=True, title='当前题块')
+                                    with PublishFrameContext(self.driver):
+                                        card_selected = card_scope.select(
+                                            self.driver,
+                                            self.publish_parser.collect_groups())
+                                    if card_selected:
+                                        scope = card_scope
+                                        selected = card_selected
+                                except Exception as exc:
+                                    print(f"    卡片范围定位失败：{str(exc)[:80]}")
+                        if not selected or not self._publish_scope_has_questions(selected):
+                            deadline = time.monotonic() + 15.0
+                            while not self._should_stop() and time.monotonic() < deadline:
+                                time.sleep(0.6)
+                                try:
+                                    with PublishFrameContext(self.driver):
+                                        retry = scope.select(
+                                            self.driver,
+                                            self.publish_parser.collect_groups()) \
+                                            if scope is not None else []
+                                except Exception:
+                                    retry = []
+                                if retry and self._publish_scope_has_questions(retry):
+                                    selected = retry
+                                    break
+                        if not selected:
+                            raise ValueError('当前可见题块尚未加载出题目组')
+                    else:
+                        scope = PublishTaskScope.capture(self.driver, anchor)
                     if '/course-v3:' in route and not scope.start_anchor:
                         raise ValueError('新版任务没有明确的正文锚点')
                     if task_name and not task_name.startswith('quick_current_page_') and scope.title:
@@ -5825,15 +11494,21 @@ class AISolver:
 
             pending = None
             for state in scoped_groups:
-                if state['kind'] in ('skip', 'upload'):
-                    if state['kind'] == 'upload':
-                        print(f"    跳过需要手动上传附件的题目组: {state['type']}")
+                if state['kind'] == 'skip':
                     continue
                 if parser.group_submitted(state['element']):
                     continue
                 key = parser.group_key(state['element'])
                 if key in self._publish_processed_groups:
                     continue
+                if state['kind'] == 'upload':
+                    print(f"    需要手动上传附件的题目组: {state['type']}")
+                    self._publish_processed_groups.add(key)
+                    return 'skipped'
+                if state['kind'] == 'ai_oral':
+                    print('    AI 口语对话需要在平台内完成')
+                    self._publish_processed_groups.add(key)
+                    return 'skipped'
                 pending = (state, key)
                 break
 
@@ -5892,29 +11567,55 @@ class AISolver:
             print("    本组有小题未能解析，不提交，请检查页面结构")
             return False
 
-        prompt = self.prompt_builder.build(questions, direction)
-        prompt += self._publish_fill_format_hint(questions)
-        if group_type == 'fill_blanks_dropdown_group':
-            prompt += self._publish_dropdown_options_prompt(questions)
-        ai_response = self.ai_client.ask(prompt, stop_requested=self.stop_requested)
-        if self._should_stop():
+        if not self._publish_prepare_media(group):
             return False
-        if not ai_response:
-            print("    AI 未返回答案")
-            return False
-
         filled = 0
-        blank_offset = 0
-        for question in questions:
-            if self._should_stop() or not self._publish_group_in_scope(group):
+        if all(question.q_type == QuestionType.RECORD for question in questions):
+            for question in questions:
+                if self._should_stop() or not self._publish_group_in_scope(group):
+                    return False
+                if not self._publish_select_record_question(group, question):
+                    print("    无法切换到口语小题，不提交")
+                    return False
+                if self.publish_executor.publish_record_uploaded(question):
+                    print("    本题已有上传录音，保留现有结果")
+                    filled += 1
+                    continue
+                answer = ''
+                if question.needs_speech_script:
+                    if group_type == 'oral_sentence_scoop_group':
+                        prompt = ('将题目中的中文括注翻译成英文，填入相应空位，返回完整英文句子。'
+                                  '去掉题号、空号、括号和中文提示，只返回可朗读的英文：\n' + question.text)
+                    else:
+                        prompt = self.prompt_builder.build_speaking_script(question, direction)
+                    answer = self.ai_client.ask(prompt, stop_requested=self.stop_requested)
+                    if not answer or self._should_stop():
+                        print("    AI 未返回口语稿")
+                        return False
+                if self.publish_executor.execute(question, answer):
+                    filled += 1
+        else:
+            prompt = self.prompt_builder.build(questions, direction)
+            prompt += self._publish_fill_format_hint(questions)
+            if group_type == 'fill_blanks_dropdown_group':
+                prompt += self._publish_dropdown_options_prompt(questions)
+            ai_response = self.ai_client.ask(prompt, stop_requested=self.stop_requested)
+            if self._should_stop():
                 return False
-            answer = self._publish_answer_text(question, ai_response, blank_offset)
-            if question.q_type == QuestionType.FILL_IN:
-                answer = self._normalize_fill_answer_capitalization(question, answer)
-            if answer and self.publish_executor.execute(question, answer):
-                filled += 1
-            if question.q_type in (QuestionType.FILL_IN, QuestionType.DROPDOWN_SELECT):
-                blank_offset += question.answer_count or 1
+            if not ai_response:
+                print("    AI 未返回答案")
+                return False
+            blank_offset = 0
+            for question in questions:
+                if self._should_stop() or not self._publish_group_in_scope(group):
+                    return False
+                answer = self._publish_answer_text(question, ai_response, blank_offset)
+                if question.q_type == QuestionType.FILL_IN:
+                    answer = self._normalize_fill_answer_capitalization(question, answer)
+                if answer and self.publish_executor.execute(question, answer):
+                    filled += 1
+                if question.q_type in (QuestionType.FILL_IN, QuestionType.DROPDOWN_SELECT):
+                    blank_offset += question.answer_count or 1
         print(f"    本组填写 {filled}/{len(questions)} 题")
 
         if filled != len(questions):
@@ -6046,6 +11747,65 @@ class AISolver:
                 continue
         return count
 
+    def _publish_select_record_question(self, group, question: Question) -> bool:
+        """按当前可见小题的位置操作上一题/下一题，不跨越题组。"""
+        nodes = self.publish_parser._question_nodes(group)
+        target = question.element.get_attribute('data-question-id')
+        for _ in range(len(nodes) + 1):
+            if self._should_stop():
+                return False
+            visible = [i for i, node in enumerate(nodes) if node.is_displayed()]
+            desired = next((i for i, node in enumerate(nodes)
+                            if node.get_attribute('data-question-id') == target), -1)
+            if desired < 0:
+                return False
+            if desired in visible:
+                return True
+            if len(visible) != 1:
+                return False
+            label = '下一个' if visible[0] < desired else '上一个'
+            buttons = group.find_elements(By.CSS_SELECTOR, '[class*="q-oral-header_handle-btn"]')
+            button = next((item for item in buttons
+                           if label in (item.text or '') and
+                           'disabled' not in (item.get_attribute('class') or '').lower()), None)
+            if not button or not WebDriverHelper.safe_click(self.driver, button):
+                return False
+            if self.stop_requested.wait(0.3):
+                return False
+        return False
+
+    def _publish_prepare_media(self, group) -> bool:
+        """只处理当前题组中的音视频材料，转写成功后才允许作答。"""
+        if self._should_stop():
+            return False
+        wrappers = group.find_elements(
+            By.CSS_SELECTOR,
+            '[data-lexical-node-type="insert-audio"], [data-lexical-node-type="insert-video"]')
+        for wrapper in wrappers:
+            kind = wrapper.get_attribute('data-lexical-node-type') or ''
+            is_video = kind == 'insert-video'
+            media = wrapper.find_elements(By.TAG_NAME, 'video' if is_video else 'audio')
+            if not media:
+                print("    音视频播放器未加载，不提交")
+                return False
+            url = (wrapper.get_attribute('data-video-url') if is_video
+                   else media[0].get_attribute('src')) or ''
+            if urlsplit(url).scheme not in ('http', 'https'):
+                print("    未找到可下载的音视频材料，不提交")
+                return False
+            if not self.publish_executor.play_material(media[0]):
+                print("    未能确认音视频播放，不提交")
+                return False
+            transcript = self.video_handler.transcriber.transcribe(url.split('#')[0], language='en')
+            if not (transcript or '').strip() or self._should_stop():
+                print("    音视频转写失败，不提交")
+                return False
+            if is_video:
+                self.ai_client.add_video_transcript_if_new(transcript)
+            else:
+                self.ai_client.add_audio_transcript_if_new(transcript)
+        return not self._should_stop()
+
     def _publish_dropdown_options_prompt(self, questions: List[Question]) -> str:
         """下拉填空：尽力抓取每个空位的候选列表，供模型按原样选择。"""
         if not questions:
@@ -6111,8 +11871,13 @@ class AISolver:
     def _publish_answer_text(self, question: Question, ai_response: str,
                              blank_offset: int = 0) -> str:
         if question.q_type in (QuestionType.SINGLE_CHOICE, QuestionType.MULTIPLE_CHOICE,
-                               QuestionType.TRUE_FALSE):
+                               QuestionType.TRUE_FALSE, QuestionType.SORTING):
             return self._extract_single_answer(ai_response, question.number)
+        if question.q_type == QuestionType.LINK_MATCH:
+            # 收紧为 {提示序号}.{选项字母}，解释文字里的残留交给 _parse_link_answer 去重
+            pairs = re.findall(r'(?<![\d.])(\d{1,2})\s*[.\-:：)）]\s*([A-Za-z])(?![A-Za-z])',
+                               ai_response or '')
+            return ' '.join(f'{n}.{letter}' for n, letter in pairs)
         answer = ai_response
         if question.q_type in (QuestionType.FILL_IN, QuestionType.DROPDOWN_SELECT):
             answer = self._sanitize_fill_answer(answer)
@@ -6267,26 +12032,95 @@ class AISolver:
         parts = []
         for q in questions:
             q_type = q.q_type.name if q.q_type else "UNKNOWN"
-            text_preview = q.text[:30] if q.text else ""
+            # 用完整题干。只取前 30 字时，相邻题目若共用长前缀（录音题的
+            # q.text 开头就是全任务固定的 directions），签名会相同，翻页被判成末页。
+            text_preview = re.sub(r'\s+', ' ', q.text or '').strip()
+            if q.q_type in (QuestionType.RECORD, QuestionType.ORAL_ALOUD):
+                # 只使用稳定题干；q.text 和 name 的回退值可能包含播放器状态。
+                stable = [(item.get('prompt') or item.get('text') or '').strip()
+                          for item in (q.record_items or [])]
+                stable = [value for value in stable if value]
+                text_preview = '|'.join(stable)
             option_preview = "|".join(opt.text[:30] for opt in q.options[:4])
-            parts.append(f"{q.number}:{q_type}:{text_preview}:{option_preview}")
+            page_progress = ""
+            if q.q_type == QuestionType.RECORD:
+                try:
+                    page_progress = self.driver.execute_script("""
+                        const progress = document.querySelector('.comp-question-progress .percent');
+                        return progress ? progress.style.width : '';
+                    """) or ""
+                except Exception:
+                    pass
+            parts.append(f"{q.number}:{q_type}:{text_preview}:{option_preview}:{page_progress}")
 
         return hashlib.md5("|".join(parts).encode()).hexdigest()[:16]
+
+    def _has_intensive_reading(self) -> bool:
+        """当前页是否有精读课文块。"""
+        try:
+            with PublishFrameContext(self.driver) as context:
+                if not context.entered:
+                    return False
+                return bool(self.driver.execute_script("""
+                    return [...document.querySelectorAll(
+                        '[data-ipublish-question-group-type="rich_text_read_group"]')]
+                        .some(g => g.getBoundingClientRect().height > 0);
+                """))
+        except Exception:
+            return False
+
+    def _click_intensive_reading(self, wait_seconds: float = 180.0) -> bool:
+        """精读课文：先停留指定时间，再点一下正文元素。"""
+        if not self._has_intensive_reading():
+            return False
+        minutes = max(1, int(round(wait_seconds / 60.0)))
+        print(f"    精读课文：先停留 {minutes} 分钟再点击正文")
+        deadline = time.monotonic() + wait_seconds
+        next_report = time.monotonic() + 60.0
+        while not self._should_stop() and time.monotonic() < deadline:
+            time.sleep(0.5)
+            now = time.monotonic()
+            if now >= next_report:
+                remain = max(0, int(round(deadline - now)))
+                print(f"    精读课文：还需等待 {remain} 秒")
+                next_report = now + 60.0
+        if self._should_stop():
+            return False
+        try:
+            with PublishFrameContext(self.driver) as context:
+                if not context.entered:
+                    return False
+                clicked = self.driver.execute_script("""
+                    const groups = [...document.querySelectorAll(
+                        '[data-ipublish-question-group-type="rich_text_read_group"]')];
+                    if (!groups.length) return false;
+                    let target = groups.find(g => {
+                        const r = g.getBoundingClientRect();
+                        return r.height > 0 && r.bottom > 0 && r.top < innerHeight;
+                    }) || groups[0];
+                    if (!target) return false;
+                    const el = target.querySelector(
+                        'p, span[class*="sentence"], div[class*="rich-sentences"]') || target;
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return true;
+                """)
+                if clicked:
+                    print("    精读课文：已点击正文元素")
+                return bool(clicked)
+        except Exception as exc:
+            print(f"    精读课文点击失败：{str(exc)[:80]}")
+            return False
 
     def solve_current_page(self, chapter_name: str = "unknown") -> bool:
         print("\n" + "=" * 60)
         print(" 开始处理当前停留的页面")
         print("=" * 60)
 
-        if getattr(self, 'uooc_mode', False):
-            self._focus_uooc_tab()
-            if not self._is_uooc_page():
-                print('    未找到优课在线标签页，请在专用 Edge 窗口打开试卷')
-                return False
-        if self._is_uooc_page():
-            return self._solve_uooc_current_page()
-
         self._publish_processed_groups = set()
+        # 每次快速处理都重新判断当前页有没有 Learning / Practicing 标签
+        self._inline_learning_tried = False
+        self._reading_ctx_tried = False
 
         quick_tab_name = f"quick_current_page_{int(time.time())}"
         self.ai_client.force_reset(f"{chapter_name}_{quick_tab_name}")
@@ -6299,9 +12133,17 @@ class AISolver:
         print(f"    内容标识: {state_key[:50]}...")
 
         if state_key in self.processed_hashes:
-            print(f"   ⏭ 该页面的哈希已被记录，正在执行作答...")
+            print(f"   【继续】该页面的哈希已被记录，正在执行作答...")
 
         self.processed_hashes.add(state_key)
+
+        # 快速模式也要能吃到课文上下文：从当前页的 courseResourceId + 面包屑单元名反推目录位置
+        try:
+            page_text = (self.driver.find_element(By.TAG_NAME, 'body').text or "").lower()
+        except Exception:
+            page_text = ""
+        if 'collocation' in page_text or 'from the texts' in page_text:
+            self._load_reading_context_for_current_page()
 
         success = self._process_current_tab_content(
             chapter_name,
@@ -6310,193 +12152,17 @@ class AISolver:
             0
         )
 
+        if not success and not self._should_stop():
+            # 必修精读课文没有题目：点一下正文元素，让阅读进度推进
+            if self._click_intensive_reading():
+                print("    当前页是精读课文（无题目），已点击正文")
+                success = True
+
         print(f"\n{'=' * 60}")
-        print(" 当前页面处理已停止" if self._should_stop() else " 当前页面处理完毕")
+        print(" 当前页面处理已停止" if self._should_stop() else
+              (" 当前页面处理完毕" if success else " 当前页面未处理完成"))
         print(f"{'=' * 60}")
         return success
-
-    def _is_uooc_page(self) -> bool:
-        host = (urlsplit(self.driver.current_url).hostname or "").lower()
-        return host == "uooc.net.cn" or host.endswith(".uooc.net.cn")
-
-    def _focus_uooc_tab(self):
-        """优课在线课程可能在新标签页打开，优先选中试卷所在页。"""
-        original = self.driver.current_window_handle
-        candidates = []
-        for handle in self.driver.window_handles:
-            try:
-                self.driver.switch_to.window(handle)
-                url = self.driver.current_url
-                if self._is_uooc_page():
-                    score = 2 if '/exam/' in url or '/home/learn/' in url else 1
-                    candidates.append((score, handle))
-            except WebDriverException:
-                continue
-        if candidates:
-            self.driver.switch_to.window(max(candidates)[1])
-        else:
-            self.driver.switch_to.window(original)
-
-    def _solve_uooc_current_page(self) -> bool:
-        """只填写当前优课在线试卷；提交试卷由用户检查后操作。"""
-        self.driver.switch_to.default_content()
-        try:
-            frames = self.driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="/exam/"]')
-            if not frames:
-                frames = self.driver.find_elements(By.CSS_SELECTOR, '[source-test] iframe')
-            if frames:
-                self.driver.switch_to.frame(frames[0])
-
-            containers = self.driver.find_elements(By.CSS_SELECTOR,
-                                                   '.testPaperShow .queContainer')
-            if not containers:
-                print("    当前页没有找到优课在线试卷题目")
-                return False
-
-            question_groups = []
-            for container in containers:
-                if self._should_stop():
-                    return False
-                questions = []
-                blocks = container.find_elements(By.CSS_SELECTOR, '.ti')
-                shared_context = []
-                for block in blocks:
-                    if block.find_elements(By.CSS_SELECTOR, '.ti-alist input[type="radio"], '
-                                           '.ti-alist input[type="checkbox"], '
-                                           '.ti-alist label.ti-a textarea'):
-                        continue
-                    titles = block.find_elements(By.CSS_SELECTOR, '.ti-q-c')
-                    if titles:
-                        shared_context.append((titles[0].text or
-                                               titles[0].get_attribute('textContent') or '').strip())
-                    for link in block.find_elements(By.CSS_SELECTOR, 'a[href$=".mp3"]'):
-                        transcript = self.video_handler.transcriber.transcribe(
-                            link.get_attribute('href'), language="en")
-                        if transcript:
-                            shared_context.append(f'【听力音频转写】{transcript}')
-                        else:
-                            shared_context = []
-                            print('    音频未能转写，跳过对应题组')
-                            break
-                if not shared_context and any(
-                        block.find_elements(By.CSS_SELECTOR, 'a[href$=".mp3"]')
-                        and not block.find_elements(By.CSS_SELECTOR, '.ti-alist input')
-                        for block in blocks):
-                    continue
-
-                for block in blocks:
-                    inputs = block.find_elements(By.CSS_SELECTOR,
-                                                 '.ti-alist input[type="radio"], '
-                                                 '.ti-alist input[type="checkbox"]')
-                    if not inputs:
-                        textareas = block.find_elements(By.CSS_SELECTOR,
-                                                        '.ti-alist label.ti-a textarea')
-                        if textareas:
-                            titles = block.find_elements(By.CSS_SELECTOR, '.ti-q-c')
-                            passage = ((titles[0].text or titles[0].get_attribute('textContent') or '').strip()
-                                       if titles else '')
-                            if not passage:
-                                continue
-                            labels = block.find_elements(By.CSS_SELECTOR, '.ti-alist label.ti-a')
-                            blank_number = 0
-                            for label in labels:
-                                fields = label.find_elements(By.CSS_SELECTOR, 'textarea')
-                                if not fields:
-                                    continue
-                                blank_number += 1
-                                label_text = (label.text or label.get_attribute('textContent') or '').strip()
-                                # The passage is shared by all blanks in this block. Include it once
-                                # in the batch prompt, then refer back to it for subsequent blanks.
-                                context = ('\n'.join(part for part in [*shared_context, passage] if part)
-                                           if blank_number == 1 else '根据本题上方的同一篇阅读材料')
-                                text = (f'{context}\n填写{label_text or f"第{blank_number}空"}。'
-                                        '若材料要求从标有字母的句子中选句，只回答一个选项字母；'
-                                        '否则只回答该空应填写的内容。')
-                                questions.append(Question(len(questions) + 1, text,
-                                                          QuestionType.TEXT, block, inputs=[fields[0]]))
-                        continue
-                    kinds = {item.get_attribute('type') for item in inputs}
-                    names = {item.get_attribute('name') for item in inputs}
-                    if len(kinds) != 1 or len(names) != 1:
-                        print('    跳过无法确定选项分组的题目')
-                        continue
-                    titles = block.find_elements(By.CSS_SELECTOR, '.ti-q-c')
-                    if not titles:
-                        continue
-                    title = titles[0]
-                    text = (title.text or title.get_attribute('textContent') or '').strip()
-                    if not text:
-                        continue
-                    audio_failed = False
-                    for link in title.find_elements(By.CSS_SELECTOR, 'a[href$=".mp3"]'):
-                        transcript = self.video_handler.transcriber.transcribe(
-                            link.get_attribute('href'), language="en")
-                        if transcript:
-                            text += f'\n【听力音频转写】{transcript}'
-                        else:
-                            audio_failed = True
-                    if audio_failed:
-                        print('    音频未能转写，跳过对应题目')
-                        continue
-                    options = []
-                    for label in block.find_elements(By.CSS_SELECTOR, '.ti-alist label.ti-a'):
-                        choices = label.find_elements(By.CSS_SELECTOR,
-                                                      'input[type="radio"], input[type="checkbox"]')
-                        if not choices:
-                            continue
-                        item = choices[0]
-                        letter = (item.get_attribute('value') or '').strip().upper()
-                        if not re.fullmatch(r'[A-Z]', letter):
-                            continue
-                        content = label.find_elements(By.CSS_SELECTOR, '.ti-a-c')
-                        option_text = content[0] if content else label
-                        option_text = (option_text.text or option_text.get_attribute('textContent') or '').strip()
-                        options.append(Option(letter, option_text, item, item.is_selected()))
-                    if not options:
-                        continue
-                    kind = (QuestionType.MULTIPLE_CHOICE if 'checkbox' in kinds
-                            else QuestionType.SINGLE_CHOICE)
-                    full_text = '\n'.join(part for part in [*shared_context, text] if part)
-                    questions.append(Question(len(questions) + 1, full_text, kind,
-                                              block, options=options))
-
-                if questions:
-                    question_groups.append(questions)
-
-            if not question_groups:
-                print("    当前页没有可处理的题目")
-                return False
-            total = sum(len(group) for group in question_groups)
-            print(f"    找到 {len(question_groups)} 道大题、{total} 道小题")
-            answered = 0
-            for group_number, questions in enumerate(question_groups, 1):
-                if self._should_stop():
-                    return False
-                print(f"    处理第 {group_number} 道大题（{len(questions)} 道小题）")
-                self.ai_client.force_reset(f"uooc_{int(time.time())}_{group_number}")
-                prompt = self.prompt_builder.build(
-                    questions,
-                    global_directions='以下小题属于同一道大题。结合题组的共享材料，按小题编号分别作答。')
-                response = self.ai_client.ask(prompt, stop_requested=self.stop_requested)
-                if not response:
-                    continue
-                for question in questions:
-                    if self._should_stop():
-                        return False
-                    answer = self._extract_single_answer(response, question.number)
-                    if answer and self.executor.execute(question, answer):
-                        if question.q_type == QuestionType.TEXT and question.inputs:
-                            # UOOC saves textarea answers from its ng-mouseleave handler.
-                            self.driver.execute_script("""
-                                arguments[0].dispatchEvent(new MouseEvent('mouseleave', {
-                                    bubbles: false, view: window
-                                }));
-                            """, question.inputs[0])
-                        answered += 1
-            print(f"    已填写 {answered}/{total} 道小题；请检查后手动提交试卷")
-            return answered == total
-        finally:
-            self.driver.switch_to.default_content()
 
     def _find_next_question_button(self) -> Optional[Any]:
         selectors = [
@@ -6673,39 +12339,177 @@ class AISolver:
             pass
         return False
 
+    def _page_needs_answer(self) -> bool:
+        """这一页有没有需要作答的控件。"""
+        driver = getattr(self, 'driver', None)
+        if driver is None:
+            return True
+        for selector in ANSWER_WIDGET_SELECTORS:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                continue
+            if not isinstance(elements, (list, tuple)):
+                continue
+            for element in elements:
+                try:
+                    if element.is_displayed():
+                        return True
+                except Exception:
+                    continue
+        return False
 
-    def _preprocess_audio_if_needed(self, tab_name: str, l1_idx: int, l2_idx: int):
+    def _release_transcriber(self):
+        handler = getattr(self, 'video_handler', None)
+        transcriber = getattr(handler, 'transcriber', None)
+        if transcriber is None:
+            return
+        try:
+            transcriber.release_local_model()
+        except Exception as exc:
+            print(f"   释放 Whisper 模型失败: {str(exc)[:60]}")
+
+    def _skip_transcription(self, tab_name: str = "") -> bool:
+        """只要求听/看的页面（Listening skills 等）不做 ASR，有作答控件就照旧转写。"""
+        title = (tab_name or "").lower()
+        retry = 0.6 if any(word in title for word in SKIP_ASR_TITLE_KEYWORDS) else 0.0
+        for attempt in range(3):
+            if self._page_needs_answer():
+                return False
+            if not retry or attempt == 2:
+                break
+            time.sleep(retry)
+        return True
+
+    def _question_screenshot(self, questions) -> Optional[bytes]:
+        """题目区域截图，给支持识图的模型补上版面结构。"""
+        if not getattr(self.config, 'screenshot', False):
+            return None
+        elements = [getattr(q, 'element', None) for q in questions]
+        elements = [element for element in elements if element is not None]
+        if not elements:
+            return None
+        try:
+            size = self.driver.execute_script("return [window.innerWidth, window.innerHeight];")
+            self.driver.execute_cdp_cmd('Emulation.setDeviceMetricsOverride', {
+                'width': max(1400, int(size[0])), 'height': max(1200, int(size[1])),
+                'deviceScaleFactor': 1, 'mobile': False})
+            try:
+                time.sleep(0.5)
+                self.driver.execute_script("""
+                    const btn = [...document.querySelectorAll('button, span, div')].find(e => {
+                        if (e.children.length || !e.getClientRects().length) return false;
+                        const t = (e.innerText || '').trim();
+                        return /^(我知道了|知道了)$/.test(t);
+                    });
+                    if (!btn) return false;
+                    const opts = {bubbles: true, cancelable: true, view: window};
+                    ['mouseover', 'mousedown', 'mouseup', 'click'].forEach(ev =>
+                        btn.dispatchEvent(new MouseEvent(ev, opts)));
+                    return true;
+                """)
+                time.sleep(0.6)
+                # 截取所有题目区域的并集。
+                rect = self.driver.execute_script("""
+                    const els = arguments[0];
+                    if (!els.length) return null;
+                    els[0].scrollIntoView({block: 'start'});
+                    const sx = window.scrollX, sy = window.scrollY;
+                    let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
+                    for (const el of els) {
+                        for (const target of [el, ...el.querySelectorAll('table')]) {
+                            const r = target.getBoundingClientRect();
+                            if (!r.width || !r.height) continue;
+                            left = Math.min(left, r.left + sx);
+                            top = Math.min(top, r.top + sy);
+                            right = Math.max(right, r.right + sx);
+                            bottom = Math.max(bottom, r.bottom + sy);
+                        }
+                    }
+                    if (!isFinite(left) || !isFinite(top)) return null;
+                    return {x: Math.max(0, left), y: Math.max(0, top),
+                            w: right - left, h: Math.min(bottom - top, 6000)};
+                """, elements)
+                if not rect:
+                    return None
+                width, height = int(rect.get('w') or 0), int(rect.get('h') or 0)
+                if width < 40 or height < 20:
+                    return None
+                scale = 1.5 if width <= 900 else 1.0
+                shot = self.driver.execute_cdp_cmd('Page.captureScreenshot', {
+                    'format': 'png',
+                    'captureBeyondViewport': True,
+                    'clip': {'x': rect['x'], 'y': rect['y'], 'width': width,
+                             'height': height, 'scale': scale},
+                })
+                return base64.b64decode(shot.get('data') or '')
+            finally:
+                self.driver.execute_cdp_cmd('Emulation.clearDeviceMetricsOverride', {})
+                time.sleep(0.3)
+        except Exception as exc:
+            print(f"    题目截图失败: {str(exc)[:60]}")
+            return None
+
+    def _preprocess_audio_if_needed(self, tab_name: str, l1_idx: int, l2_idx: int,
+                                    skip_transcription: Optional[bool] = None,
+                                    on_transcript: Optional[Callable[[str], None]] = None):
         """检测并预处理音频：下载+转录，将转录文本注入 AI 上下文"""
         if self._should_stop():
             return
         if self._has_video_on_page():
             return
 
+        if skip_transcription is None:
+            skip_transcription = self._skip_transcription(tab_name)
+        if skip_transcription:
+            print("   该页不需要作答，跳过音频转写")
+            return
+
+        # 纯听音频任务只播放，跟读题直接使用样音，均不需要转写。
+        if find_record_buttons(self.driver) or AudioStrategy.is_audio_only_page(self.driver):
+            return
+
         if not self._has_audio_on_page():
             return
 
         try:
-            audio_url = self._extract_audio_url_from_page()
-            if not audio_url:
+            audio_urls = self._extract_audio_urls_from_page()
+            if not audio_urls:
                 print("   未找到有效音频URL，跳过")
                 return
 
-            audio_key = audio_url.split('#')[0]
-            if audio_key in self._processed_audio_tabs:
+            # 逐段转写，避免后面的题缺少上下文。
+            if self._processed_audio_context is not self.ai_client.material_messages:
+                self._processed_audio_tabs.clear()
+                self._processed_audio_context = self.ai_client.material_messages
+            pending = [url for url in audio_urls
+                       if url.split('#')[0] not in self._processed_audio_tabs]
+            if not pending:
                 return
 
-            print("   检测到音频，开始预处理（下载+转录）...")
-            transcript = self.video_handler.transcriber.transcribe(audio_url, language="en")
+            for index, audio_url in enumerate(pending, 1):
+                if self._should_stop():
+                    return
+                audio_key = audio_url.split('#')[0]
+                print(f"   音频转写 {index}/{len(pending)}...")
+                transcript = self.video_handler.transcriber.transcribe(
+                    audio_url, language="en")
 
-            if self._should_stop():
-                return
-            if transcript:
-                self.ai_client.add_audio_transcript_if_new(transcript)
-                print(f"   已将音频转录（{len(transcript)}字符）加入上下文")
-            else:
-                print("   音频转录为空")
+                if self._should_stop():
+                    return
+                if transcript:
+                    self.ai_client.add_audio_transcript_if_new(transcript)
+                    print(f"   音频转写完成（{len(transcript)}字符）")
+                else:
+                    print("   音频转写为空")
 
-            self._processed_audio_tabs.add(audio_key)
+                self._processed_audio_tabs.add(audio_key)
+
+            if on_transcript:
+                try:
+                    on_transcript("audio")
+                except Exception as exc:
+                    print(f"   预取答案启动失败: {str(exc)[:60]}")
 
         except Exception as e:
             print(f"   预处理失败: {str(e)[:80]}")
@@ -6735,30 +12539,41 @@ class AISolver:
         except:
             return False
 
-    def _extract_audio_url_from_page(self) -> Optional[str]:
-        """从页面提取音频URL"""
+    def _extract_audio_urls_from_page(self) -> List[str]:
+        urls: List[str] = []
         try:
-            audio_elem = self.driver.find_element(By.CSS_SELECTOR, 'audio')
-            src = audio_elem.get_attribute('src')
-            if src:
-                return src.split('#')[0]
+            elems = self.driver.find_elements(By.CSS_SELECTOR, 'audio, audio source')
+        except Exception:
+            return urls
+        for elem in elems:
+            try:
+                src = (elem.get_attribute('src') or '').strip()
+            except Exception:
+                continue
+            if not src:
+                continue
+            key = src.split('#')[0]
+            if key and key not in urls:
+                urls.append(key)
+        return urls
 
-            sources = self.driver.find_elements(By.CSS_SELECTOR, 'audio source')
-            for source in sources:
-                src = source.get_attribute('src')
-                if src:
-                    return src.split('#')[0]
+    def _extract_audio_url_from_page(self) -> Optional[str]:
+        urls = self._extract_audio_urls_from_page()
+        return urls[0] if urls else None
 
-            return None
-        except:
-            return None
-
-    def _preprocess_video_if_needed(self, tab_name: str, l1_idx: int, l2_idx: int):
+    def _preprocess_video_if_needed(self, tab_name: str, l1_idx: int, l2_idx: int,
+                                    skip_transcription: Optional[bool] = None,
+                                    on_transcript: Optional[Callable[[str], None]] = None):
         """检测并预处理视频：播放、转录、处理弹窗，将转录文本注入 AI 上下文"""
         if self._should_stop():
             return
         if not self._has_video_on_page():
             return
+
+        if skip_transcription is None:
+            skip_transcription = self._skip_transcription(tab_name)
+        skip_transcription = bool(skip_transcription)
+        self.video_handler.skip_transcription = skip_transcription
 
         try:
             video_info = self.video_handler._get_video_info()
@@ -6767,30 +12582,74 @@ class AISolver:
             if video_key in self._processed_video_tabs:
                 return
 
-            print("   检测到视频，开始预处理（播放+转录）...")
-            self.video_handler._play_video_and_handle_popups()
+            if video_key in self._skipped_video_tabs:
+                if skip_transcription:
+                    return
+                # 之前跳过，现在有题，补转写但不重播。
+                print("   补做视频转写...")
+                self.video_handler.skip_transcription = False
+                transcript = self.video_handler.ensure_transcript()
+                self._skipped_video_tabs.discard(video_key)
+                if transcript:
+                    self.ai_client.add_video_transcript_if_new(transcript)
+                    print(f"   视频转写完成（{len(transcript)}字符）")
+                    if on_transcript:
+                        on_transcript(transcript)
+                    self._processed_video_tabs.add(video_key)
+                else:
+                    print("   视频转写失败")
+                    self._skipped_video_tabs.add(video_key)
+                return
+
+            if skip_transcription:
+                print("   只播放，不转写")
+            else:
+                print("   播放并转写视频...")
+            injected = {'done': False}
+
+            def _inject_transcript_then_notify(transcript):
+                """先把转写写进 AI 上下文，再启动答案预取。
+
+                预取与视频播放并行，如果启动时上下文里还没有视频转写，
+                播放前已出现的题目就会只带着题干去请求答案，而这份缺内容
+                的预取结果后面还会被直接使用。
+                """
+                if transcript:
+                    self.ai_client.add_video_transcript_if_new(transcript)
+                    injected['done'] = True
+                if on_transcript:
+                    on_transcript(transcript)
+
+            self.video_handler._play_video_and_handle_popups(
+                on_transcript=_inject_transcript_then_notify)
 
             if self._should_stop():
                 return
             transcript = self.video_handler.video_transcript
             if transcript:
-                self.ai_client.add_video_transcript_if_new(transcript)
-                print(f"   已将视频转录（{len(transcript)}字符）加入上下文")
+                if not injected['done']:
+                    self.ai_client.add_video_transcript_if_new(transcript)
+                print(f"   视频转写完成（{len(transcript)}字符）")
+                self._processed_video_tabs.add(video_key)
+            elif skip_transcription:
+                self._skipped_video_tabs.add(video_key)
             else:
-                print("   未获得视频转录，后续题目可能缺乏上下文")
-
-            self._processed_video_tabs.add(video_key)
+                print("   视频转写失败")
+                self._processed_video_tabs.add(video_key)
 
         except Exception as e:
             print(f"   预处理失败: {str(e)[:80]}")
             logger.error(f"视频预处理异常: {e}", exc_info=True)
 
     def _has_video_on_page(self) -> bool:
-        """检测当前页面是否包含可见的视频元素"""
+        """检测可见视频，兼容无 <video> 标签的播放器。"""
         try:
             videos = self.driver.find_elements(By.TAG_NAME, 'video')
+            if not videos:
+                videos = self.driver.find_elements(
+                    By.CSS_SELECTOR, '.video-js, .video-box, .question-video-player')
             return any(v.is_displayed() for v in videos)
-        except:
+        except Exception:
             return False
 
     def _wait_for_submit_complete(self, timeout: int = 8):
@@ -6869,62 +12728,32 @@ class AISolver:
         return False
 
 
-class DeferredEdgeDriver:
-    """优课在线手动验证完成后才绑定 WebDriver。"""
-
-    def __init__(self):
-        self._driver = None
-
-    def bind(self, driver):
-        self._driver = driver
-
-    @property
-    def is_connected(self):
-        return self._driver is not None
-
-    def unbind(self):
-        driver, self._driver = self._driver, None
-        if driver is not None:
-            driver.service.stop()
-
-    def __getattr__(self, name):
-        if self._driver is None:
-            raise RuntimeError('请先手动完成验证，再连接浏览器')
-        return getattr(self._driver, name)
-
-    def quit(self):
-        if self._driver is not None:
-            self._driver.quit()
-
-
 class UCampusBot:
     """U校园机器人 - 组装所有组件"""
 
-    def __init__(self, config_path: str = 'config.json', skip_check: bool = False,
-                 uooc_mode: bool = False):
+    def __init__(self, config_path: str = 'config.json', skip_check: bool = False):
         self.config = Config.from_json(config_path)
-        self.uooc_mode = uooc_mode
+        # 门禁与 driver 共用同一份规格，避免两边指向不同浏览器
+        self.browser = get_spec(self.config.browser)
+        self._shutdown_event = threading.Event()
+        self._background_threads = []
         self.driver = None
 
         if not skip_check:
             self._ensure_environment()
 
-        if self.uooc_mode:
-            self.driver = DeferredEdgeDriver()
-            self.popup_watcher = None
-        else:
-            self.driver = self._create_driver()
-            self.popup_watcher = PopupWatcher(self.driver)
+        self.driver = self._create_driver()
+        self.popup_watcher = PopupWatcher(self.driver)
 
     def _ensure_environment(self):
-        checker = EnvironmentChecker()
+        checker = EnvironmentChecker(self.browser.key)
 
         if not checker.check_all():
             while True:
                 choice = checker.show_fix_guide()
 
                 if choice == '1':
-                    checker.auto_install_edge()
+                    checker.auto_install_browser()
                     sys.exit(0)
 
                 elif choice == '2':
@@ -6957,12 +12786,20 @@ class UCampusBot:
                     print("无效选项，请重新选择")
 
     def _show_detailed_help(self):
-        print("""
+        name = self.browser.display_name
+        hints = " / ".join(self.browser.manual_install_hint)
+        if self.browser.supports_auto_install:
+            browser_fix = f"       解决：选择 [1] 自动安装，或手动访问 {hints}"
+        else:
+            browser_fix = f"       解决：这个浏览器不提供自动安装，请手动下载：{hints}"
+
+        print(f"""
     【问题诊断】
 
-    1. Edge 浏览器问题
-       原因：Edge 未安装
-       解决：选择 [1] 自动安装，或访问 https://www.microsoft.com/edge
+    1. {name} 浏览器问题
+       原因：{name} 未安装，或安装在非默认位置
+{browser_fix}
+       如需改用另一种浏览器：在 config.json 里修改 "browser"（edge / chrome）后重启
 
     2. FFmpeg 问题（语音识别必需）
        原因：未安装 FFmpeg 或未添加到系统 PATH
@@ -6986,47 +12823,82 @@ class UCampusBot:
     6. 重启终端，输入 ffmpeg -version 验证
     """)
 
-    COMPAT_EDGE_ARGS = ('--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
-                        '--disable-extensions')
+    COMPAT_BROWSER_ARGS = ('--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+                           '--disable-extensions')
 
-    def _start_edge(self, temp_dir: str, extra_args=()):
-        """启动 Edge；优课在线使用独立持久资料，供用户手动登录验证。"""
-        options = webdriver.EdgeOptions()
-        if not self.uooc_mode:
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    # 录音题需要：不再弹麦克风授权框 + AudioContext 无需用户手势即可启动
+    MIC_BROWSER_ARGS = ('--use-fake-ui-for-media-stream',
+                        '--autoplay-policy=no-user-gesture-required')
+
+    def _start_browser(self, temp_dir: str, extra_args=()):
+        """按指定临时目录启动浏览器，并注入反检测脚本。"""
+        options_cls, webdriver_cls, service_cls = driver_api(self.browser)
+        options = options_cls()
+
+        # 环境检查与 driver 读同一条检测结果：找到就用它启动，
+        # 找不到才退到 Selenium Manager 自己解析。
+        install_path = self.browser.detect_install_path()
+        if install_path:
+            options.binary_location = install_path
+
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        # 新版播放器在窄窗口下会使用需要原生插件的平板录音器。
+        options.add_argument('--window-size=1600,1000')
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        for argument in self.MIC_BROWSER_ARGS:
+            options.add_argument(argument)
         for argument in extra_args:
             options.add_argument(argument)
 
-        if self.uooc_mode:
-            user_data_dir = os.path.join(BASE_DIR, 'data', 'uooc-edge-profile')
-            os.makedirs(user_data_dir, exist_ok=True)
-        else:
-            try:
-                user_data_dir = tempfile.mkdtemp(prefix='ucampus_', dir=temp_dir or None)
-            except Exception:
-                user_data_dir = tempfile.mkdtemp(prefix='ucampus_')
+        try:
+            user_data_dir = tempfile.mkdtemp(prefix='ucampus_', dir=temp_dir or None)
+        except Exception:
+            user_data_dir = tempfile.mkdtemp(prefix='ucampus_')
         options.add_argument(f'--user-data-dir={user_data_dir}')
         if temp_dir:
-            options.add_argument(f'--disk-cache-dir={os.path.join(temp_dir, "edge_cache")}')
+            cache_dir = os.path.join(temp_dir, self.browser.profile_dir_name)
+            options.add_argument(f'--disk-cache-dir={cache_dir}')
             options.add_argument(f'--crash-dumps-dir={temp_dir}')
 
-        bundled_driver = os.path.join(BASE_DIR, 'drivers', 'msedgedriver.exe')
-        if os.path.isfile(bundled_driver):
-            try:
-                driver = webdriver.Edge(service=Service(bundled_driver), options=options)
-            except SessionNotCreatedException:
-                driver = webdriver.Edge(options=options)
-        else:
-            driver = webdriver.Edge(options=options)
-        if not self.uooc_mode:
+        service_options = {}
+        if sys.platform == 'win32':
+            # Let Python handle Ctrl+C and close the driver in order; the driver
+            # must not receive the console interrupt before cleanup starts.
+            service_options['popen_kw'] = {'creation_flags': subprocess.CREATE_NEW_PROCESS_GROUP}
+        try:
+            driver = webdriver_cls(options=options, service=service_cls(**service_options))
+        except NoSuchDriverException:
+            if not install_path:
+                raise
+            # 指定了路径反而拿不到 driver（该路径不是 Selenium Manager 认识的
+            # 发行版，或探测到的那一刻文件正好不可用）时，退回自动解析，
+            # 避免这条分支比「不指定路径」更容易失败。
+            print(f" 按 {install_path} 取不到 driver，改由自动解析重试...")
+            options.binary_location = ""
+            driver = webdriver_cls(options=options, service=service_cls(**service_options))
+        try:
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                 "source": "Object.defineProperty(navigator, 'webdriver', {get: () => false});"
             })
+        except BaseException:
+            # A failed tab can still leave a live browser behind. Close this
+            # attempt before the caller retries with compatibility options.
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            raise
+        # 把麦克风轨道换成「页面自带原声」的载体，供跟读录音题使用
+        try:
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": RECORD_MIC_BOOTSTRAP_JS
+            })
+        except Exception as exc:
+            logger.warning(f"录音注入脚本安装失败: {str(exc)[:100]}")
         return driver
 
     def _create_driver(self):
-        # 系统临时目录不可写时，Edge 会报
+        # 系统临时目录不可写时，浏览器会报
         # "cannot create temp dir for unpacking extensions"，这里统一换成可写目录
         temp_dir = ensure_writable_temp_dir()
 
@@ -7039,106 +12911,88 @@ class UCampusBot:
             pass
 
         try:
-            return self._start_edge(temp_dir)
+            return self._start_browser(temp_dir)
+        except NoSuchDriverException as exc:
+            # 通常意味着浏览器本身没装（或装在非默认路径），重试也没用，直接指路
+            print(f"\n 找不到 {self.browser.display_name} 的 driver：{str(exc)[:120]}")
+            print(f"   请确认已安装 {self.browser.display_name}，或在 config.json 里改 \"browser\"（edge / chrome）")
+            for hint in self.browser.manual_install_hint:
+                print(f"   下载：{hint}")
+            raise
         except (SessionNotCreatedException, WebDriverException) as exc:
             # 受限环境（沙箱/受限用户/显卡驱动异常）下首次启动可能失败，降级重试一次：
             # 换新的临时 profile 并加上兼容参数
-            print(f" 启动 Edge 失败（{str(exc)[:120]}），尝试兼容模式重试...")
-            return self._start_edge(temp_dir, extra_args=self.COMPAT_EDGE_ARGS)
+            print(f" 启动 {self.browser.display_name} 失败（{str(exc)[:120]}），尝试兼容模式重试...")
+            return self._start_browser(temp_dir, extra_args=self.COMPAT_BROWSER_ARGS)
+        except Exception as exc:
+            # 驱动握手超时（urllib3 ReadTimeoutError）等非 WebDriverException 也要重试
+            print(f" 启动 {self.browser.display_name} 超时（{str(exc)[:120]}），尝试兼容模式重试...")
+            return self._start_browser(temp_dir, extra_args=self.COMPAT_BROWSER_ARGS)
 
     def start(self):
         solver = AISolver(self.driver, self.config)
-        solver.uooc_mode = self.uooc_mode
 
-        self.gui = FluentModernGUI(self.driver, solver, self, globals())
+        from unipus_helper.native_ui import NativeModernGUI
+        self.gui = NativeModernGUI(self.driver, solver, self, globals())
 
-        if self.uooc_mode:
-            threading.Thread(target=self._open_uooc, daemon=True).start()
-        else:
-            threading.Thread(target=self.popup_watcher.run, daemon=True).start()
-            threading.Thread(target=self._background_login_flow, daemon=True).start()
+        self._background_threads = [
+            threading.Thread(target=self.popup_watcher.run, daemon=True, name="popup-watcher"),
+            threading.Thread(target=self._background_login_flow, daemon=True, name="ucampus-login"),
+        ]
+        for worker in self._background_threads:
+            worker.start()
 
-        self.gui.mainloop()
+        try:
+            self.gui.mainloop()
+        finally:
+            self.request_shutdown()
 
         return True
 
-    def _open_uooc(self):
-        try:
-            profile = os.path.join(BASE_DIR, 'data', 'uooc-edge-profile')
-            os.makedirs(profile, exist_ok=True)
-            port_file = os.path.join(BASE_DIR, 'data', 'uooc-edge-port.txt')
-            try:
-                with open(port_file, encoding='ascii') as stream:
-                    old_port = int(stream.read().strip())
-                if self._uooc_debugger_ready(old_port):
-                    self.uooc_port = old_port
-                    gui_log_queue.put('检测到已打开的优课在线专用 Edge；完成手动验证后可连接。')
-                    self.gui.after(0, self.gui.enable_uooc_manual_mode)
-                    return
-            except (OSError, ValueError):
-                pass
-            with socket.socket() as sock:
-                sock.bind(('127.0.0.1', 0))
-                self.uooc_port = sock.getsockname()[1]
-            edge = next((p for p in (
-                r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
-                r'C:\Program Files\Microsoft\Edge\Application\msedge.exe') if os.path.isfile(p)), None)
-            if not edge:
-                raise FileNotFoundError('未找到 Microsoft Edge')
-            self.uooc_process = subprocess.Popen([
-                edge, f'--user-data-dir={profile}',
-                '--remote-debugging-address=127.0.0.1',
-                f'--remote-debugging-port={self.uooc_port}',
-                'https://www.uooc.net.cn/'
-            ])
-            for _ in range(30):
-                with socket.socket() as probe:
-                    probe.settimeout(0.5)
-                    if probe.connect_ex(('127.0.0.1', self.uooc_port)) == 0:
-                        break
-                time.sleep(0.5)
-            else:
-                raise RuntimeError('浏览器调试端口未启动，请关闭旧优课在线专用 Edge 后重试')
-            with open(port_file, 'w', encoding='ascii') as stream:
-                stream.write(str(self.uooc_port))
-            gui_log_queue.put('请在新打开的 Edge 中手动登录并完成验证，然后点击“完成验证后连接”。')
-            self.gui.after(0, self.gui.enable_uooc_manual_mode)
-        except Exception as exc:
-            gui_log_queue.put(f'打开优课在线失败：{str(exc)[:80]}')
-            logger.error('打开优课在线失败', exc_info=True)
+    def request_shutdown(self):
+        self._shutdown_event.set()
+        self.popup_watcher.stop()
 
-    @staticmethod
-    def _uooc_debugger_ready(port):
-        if not 1 <= port <= 65535:
-            return False
-        import urllib.request
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            with opener.open(f'http://127.0.0.1:{port}/json/version', timeout=1) as response:
-                return 'Edg' in json.load(response).get('Browser', '')
-        except (OSError, ValueError):
-            return False
-
-    def connect_uooc(self):
-        options = webdriver.EdgeOptions()
-        options.debugger_address = f'127.0.0.1:{self.uooc_port}'
-        bundled_driver = os.path.join(BASE_DIR, 'drivers', 'msedgedriver.exe')
-        if os.path.isfile(bundled_driver):
-            try:
-                attached = webdriver.Edge(service=Service(bundled_driver), options=options)
-            except SessionNotCreatedException:
-                attached = webdriver.Edge(options=options)
-        else:
-            attached = webdriver.Edge(options=options)
-        self.driver.bind(attached)
-
-    def disconnect_uooc(self):
-        self.driver.unbind()
+    def restart_browser(self):
+        """关掉当前课程浏览器再拉起一个新的，返回新的 driver。"""
+        old, self.driver = self.driver, None
+        self.popup_watcher.stop()
+        if old is not None:
+            def quit_old():
+                try:
+                    old.quit()
+                except Exception:
+                    pass
+            worker = threading.Thread(target=quit_old, daemon=True, name="browser-quit")
+            worker.start()
+            worker.join(timeout=6)
+            if worker.is_alive():
+                service = getattr(old, "service", None)
+                process = getattr(service, "process", None)
+                if process and process.poll() is None:
+                    try:
+                        if sys.platform == 'win32':
+                            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                           capture_output=True, timeout=3,
+                                           creationflags=subprocess.CREATE_NO_WINDOW)
+                        else:
+                            process.terminate()
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+        self.driver = self._create_driver()
+        self.popup_watcher = PopupWatcher(self.driver)
+        threading.Thread(target=self.popup_watcher.run, daemon=True, name="popup-watcher").start()
+        return self.driver
 
     def _background_login_flow(self):
         gui_log_queue.put(" 正在与 U校园 建立连接，请稍候...")
-        success = self._login()
-        if success:
+        try:
+            success = self._login()
+        except Exception as exc:
+            if not self._shutdown_event.is_set():
+                logger.error(f"登录线程异常: {exc}", exc_info=True)
+            return
+        if success and not self._shutdown_event.is_set():
             self.gui.after(0, self.gui.enable_scan_button)
 
     def _login(self) -> bool:
@@ -7172,10 +13026,11 @@ class UCampusBot:
                 password = WebDriverWait(self.driver, 20).until(
                     EC.element_to_be_clickable((By.ID, 'password')))
                 agreement_check = self.driver.find_element(By.ID, 'agreement')
-                username.clear()
-                username.send_keys(self.config.username)
-                password.clear()
-                password.send_keys(self.config.password)
+                # 「记住我」会把上次账号预填进输入框，而 clear() 对 React 受控
+                # 输入框不生效，直接把账号追加成两遍导致登录失败，这里统一走
+                # 原生 setter + input 事件写入，并回读校验。
+                self._fill_login_input(username, self.config.username, '账号')
+                self._fill_login_input(password, self.config.password, '密码')
                 if not agreement_check.is_selected():
                     agreement_control = WebDriverWait(self.driver, 20).until(
                         EC.element_to_be_clickable((
@@ -7203,7 +13058,7 @@ class UCampusBot:
                 login_btn.click()
 
                 gui_log_queue.put(" 如果遇到验证码，请在弹出的浏览器中手动进行人机验证。")
-                gui_log_queue.put("⏳ 正在智能轮询登录状态...")
+                gui_log_queue.put("【等待】正在智能轮询登录状态...")
                 WebDriverWait(self.driver, 120).until(
                     lambda driver: driver.current_url.startswith("https://ucloud.unipus.cn/"))
 
@@ -7228,6 +13083,8 @@ class UCampusBot:
             return True
 
         except Exception as e:
+            if self._shutdown_event.is_set():
+                return False
             error_msg = str(e)
             gui_log_queue.put(f" 登录执行流阻断: {error_msg[:50]}")
             logger.error(f"详细错误: {error_msg}", exc_info=True)
@@ -7284,6 +13141,47 @@ class UCampusBot:
                 hasPortal: !!(portal.Authorization || (portal.tokenInfo && portal.tokenInfo.jwt))
             };
         """, legacy_token, configured_jwt, cookie_jwt)
+
+    @staticmethod
+    def _fill_login_input(element, value: str, label: str = '输入框') -> bool:
+        """可靠写入登录表单：原生 setter + input/change 事件，最后回读校验。
+
+        账号中心是 React 受控组件，「记住我」会预填旧账号，而 Selenium 的
+        clear() 不一定能清掉受控状态（会变成把新值追加到旧值后面），
+        所以这里先整体替换 value，再派发事件让框架同步 state。
+        """
+        script = """
+            const el = arguments[0], value = arguments[1];
+            el.focus();
+            const proto = Object.getPrototypeOf(el);
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; }
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            return el.value;
+        """
+        try:
+            written = element.parent.execute_script(script, element, value)
+        except Exception as exc:
+            print(f"  {label}写入异常: {str(exc)[:60]}")
+            written = None
+        if written == value:
+            return True
+
+        # 兜底：聚焦后全选删除，再逐字符输入
+        try:
+            element.click()
+            element.send_keys(Keys.CONTROL, 'a')
+            element.send_keys(Keys.DELETE)
+            element.send_keys(value)
+            written = element.get_attribute('value') or ''
+        except Exception as exc:
+            print(f"  {label}键盘写入异常: {str(exc)[:60]}")
+            return False
+        if written != value:
+            print(f"  {label}写入校验失败: 期望 {value!r}, 实际 {written!r}")
+            return False
+        return True
 
     @staticmethod
     def _has_live_auth(driver) -> bool:
@@ -7351,16 +13249,26 @@ class PopupWatcher:
 
     def __init__(self, driver):
         self.driver = driver
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
 
     def run(self):
-        while True:
+        while not self._stop_event.is_set():
             try:
                 self._click_known_buttons()
-                time.sleep(0.5)
+            except WebDriverException as e:
+                if not self._stop_event.is_set():
+                    logger.warning(f"弹窗监控已停止，浏览器会话不可用: {str(e)[:120]}")
+                break
             except Exception as e:
+                if self._stop_event.is_set():
+                    break
                 error_msg = str(e)
                 print(f"操作失败: {error_msg[:50]}")
-                logger.error(f"详细错误: {error_msg}", exc_info=True)
+                logger.warning(f"弹窗监控操作失败: {error_msg[:120]}")
+            self._stop_event.wait(0.5)
 
     def _click_known_buttons(self):
         js = """
@@ -7397,11 +13305,10 @@ class PopupWatcher:
 if __name__ == '__main__':
     print('*' * 25 + "Unipus-Helper" + '*' * 25)
 
-    # 先把临时目录换成可写的：受限环境下 Edge 启动会因为系统 TEMP 不可写而失败
+    # 先把临时目录换成可写的：受限环境下浏览器启动会因为系统 TEMP 不可写而失败
     ensure_writable_temp_dir()
 
     skip_check = '--skip-check' in sys.argv
-    uooc_mode = '--uooc' in sys.argv
 
     if not skip_check:
         print("\n 提示：")
@@ -7411,12 +13318,37 @@ if __name__ == '__main__':
 
     logger = setup_logging()
 
+    bot = None
+    exit_code = 0
     try:
-        bot = UCampusBot(os.path.join(BASE_DIR, 'config.json'), skip_check=skip_check,
-                         uooc_mode=uooc_mode)
+        if not os.path.exists(os.path.join(BASE_DIR, 'config.json')):
+            from unipus_helper.native_ui import setup_first_run
+            qt_app, configured = setup_first_run()
+            if not configured:
+                sys.exit(0)
+        bot = UCampusBot(os.path.join(BASE_DIR, 'config.json'), skip_check=skip_check)
         bot.start()
+    except KeyboardInterrupt:
+        print("\n 正在关闭工作台与课程浏览器...")
     except Exception as e:
         error_msg = str(e)
         print(f"\n 程序运行失败: {error_msg[:100]}")
         logger.error(f"程序异常: {error_msg}", exc_info=True)
-        input("\n按任意键退出...")
+        exit_code = 1
+    finally:
+        if bot:
+            bot.request_shutdown()
+            gui = getattr(bot, 'gui', None)
+            if gui and hasattr(gui, 'close'):
+                gui.close()
+            elif bot.driver:
+                try:
+                    bot.driver.quit()
+                except Exception:
+                    pass
+    sys.exit(exit_code)
+
+
+
+
+

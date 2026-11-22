@@ -1,11 +1,40 @@
 # U 校园便携助手
 
-基于 [YSJohnson/UnipusAI-Helper](https://github.com/YSJohnson/UnipusAI-Helper) 的本机修复版。原项目采用 AGPL-3.0 许可证；原作者署名与许可证保留在发布包中。
+基于 [YSJohnson/UnipusAI-Helper](https://github.com/YSJohnson/UnipusAI-Helper) v3.9.11 的 Windows 便携版（PySide6 / Qt Quick 界面），并针对教材页面增加了若干本地适配。上游采用 AGPL-3.0 许可证，署名与许可证保留在发布包内。
+
+## 版本
+
+- **v1.1.9**：扫描诊断（顶部标签任务识别 + 扫描过程写入日志）
+- v1.1.8：顶部标签本身就是任务时（如「听力高频词汇训练 1-4」）全部识别
+- v1.1.7：修复协议相对音频地址（`//host/...`）导致词汇跟读、录音题失败
+- v1.1.6：精读课文无题目时先停留 3 分钟再点击正文
+- v1.1.5：无题目且为精读课文时，点击正文元素
+- v1.1.4：题块懒加载等待（最多 15 秒）
+- v1.1.3：教材「答题」卡片自动点开并锁定新题组
+- v1.1.2：题干不在题组内时取卡片前正文
+- v1.1.1：同步上游 v3.9.11（修复新播放器题组渲染、排序题、听力上下文与选择题解析）
+- v1.1.0：同步上游 v3.9.9（Qt Quick 工作台）
+- v1.0.0：基于上游旧版（PyQt5 / Fluent 工作台）
 
 ## Windows 便携版
 
-从 Releases 下载 ZIP，完整解压后双击 `start.cmd`。首次运行会打开配置编辑器，填写自己的 U 校园账号和 AI API Key，保存后程序继续启动。之后可用 `configure.cmd` 修改配置。
+从 Releases 下载 ZIP，完整解压后双击 `start.cmd`。首次启动会打开配置界面，填写 U 校园 AI 版账号与 AI 接口配置；保存后进入工作台，在 Edge 中登录并完成平台验证，再扫描课程任务。
 
-登录成功后，在 Edge 中进入具体课程页面，再使用“扫描任务列表”；也可在题目页使用“快速处理当前页”。本版包含 Python 运行时、Whisper base 模型、FFmpeg 和适配 Edge 157 的 WebDriver。Edge 更新到其他大版本后，程序会尝试自动查找匹配驱动。
+发布包内置 Python 3.12 运行时、PySide6、FFmpeg 与 Whisper base 模型；浏览器驱动由 Selenium 自动匹配，首次启动需要联网。公开包与仓库均不含 `config.json`、账号、密码、API Key 或浏览器资料。
 
-公开仓库与 ZIP 均不包含本机 `config.json`、账号、密码、API Key 或浏览器资料。
+## 本地适配说明
+
+针对《理解当代中国》等教材页与听力训练页，在 `UnipusAI_Helper.py` / `unipus_helper/course_catalog.py` 中增加了：
+
+1. 题干不在题组内部时，取题组前最近正文作为题干
+2. 题目以「答题」卡片呈现时，自动点开并锁定新渲染的题组
+3. 题块懒加载时等待渲染（最多 15 秒）
+4. 精读课文无题目时，停留 3 分钟后点击正文元素
+5. 协议相对音频地址（`//host/...`）自动补全为 `https://`
+6. 顶部标签本身是任务时，扫描识别全部标签
+
+详细差异见 `SYNC_NOTES.md`。
+
+## 构建
+
+打包流程见 `.github/workflows/portable.yml`，在 Actions 中手动触发。运行时底座复用同账号下超星便携包的 Python 运行时、FFmpeg 与 Whisper 模型，应用文件来自本仓库。

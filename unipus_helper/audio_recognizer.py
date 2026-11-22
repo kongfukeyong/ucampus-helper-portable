@@ -1,10 +1,9 @@
-import whisper
+import gc
 import tempfile
 import os
 import traceback
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Dict, Optional
 
 
@@ -16,7 +15,6 @@ class AudioTranscriber:
     def __init__(self):
         self.local_model = None
         self._transcript_cache: Dict[str, str] = {}
-        self._init_local_model()
 
     @staticmethod
     def _print_exception(prefix: str, exc: Exception) -> None:
@@ -29,12 +27,12 @@ class AudioTranscriber:
     def _init_local_model(self):
         """初始化本地 Whisper 模型"""
         try:
+            # 进到需要转写的页面才导入，省掉整轮只播放的练习里的启动开销
+            import whisper
             print("       加载 Whisper 本地模型 (base)...")
             # 可选: tiny, base, small, medium, large
             # base 是速度与准确率的平衡选择
-            bundled_model = Path(__file__).resolve().parent / "data" / "models" / "base.pt"
-            self.local_model = whisper.load_model(
-                str(bundled_model) if bundled_model.is_file() else "base")
+            self.local_model = whisper.load_model("base")
             print("       本地模型加载完成")
         except ImportError:
             print("       未安装 whisper，请运行: pip install openai-whisper")
@@ -42,6 +40,24 @@ class AudioTranscriber:
         except Exception as e:
             self._print_exception("       加载本地模型失败", e)
             raise
+
+    def _ensure_local_model(self) -> bool:
+        """真要转写时才加载模型。"""
+        if self.local_model is not None:
+            return True
+        try:
+            self._init_local_model()
+        except Exception:
+            return False
+        return self.local_model is not None
+
+    def release_local_model(self) -> None:
+        """释放本地模型，下次要转写时再加载。"""
+        if self.local_model is None:
+            return
+        self.local_model = None
+        gc.collect()
+        print("       已释放 Whisper 模型")
 
     def transcribe(self, audio_url: str, language: str = "en") -> str:
         """
@@ -62,7 +78,9 @@ class AudioTranscriber:
         audio_path = None
 
         try:
-            print(f"      ⬇  下载音频...")
+            if not self._ensure_local_model():
+                return ""
+            print(f"      【下载】获取音频...")
             with urllib.request.urlopen(audio_url, timeout=30) as response, \
                     tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 f.write(response.read())
